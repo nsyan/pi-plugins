@@ -1,0 +1,10 @@
+spring:
+  datasource:
+    url: jdbc:mysql://10.0.0.5:3306/demo?serverTimezone=Asia/Shanghai
+    username: root
+    password: ${DB_PASSWORD:secret123}
+  data:
+    redis:
+      host: 10.0.0.6
+      port: 6379
+      password: ${REDIS_PASSWORD:}

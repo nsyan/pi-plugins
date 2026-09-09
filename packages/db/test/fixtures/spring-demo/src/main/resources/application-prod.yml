@@ -1,0 +1,5 @@
+spring:
+  datasource:
+    url: jdbc:mysql://10.0.0.9:3306/demo_prod
+    username: app
+    password: ENC(xYz123==)

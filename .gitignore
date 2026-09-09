@@ -1,0 +1,40 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+build/
+*.tsbuildinfo
+coverage/
+
+# 日志
+*.log
+logs/
+
+# 环境变量（含真实凭据，绝不提交）
+.env
+.env.*
+.env.local
+.env.*.local
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# superpowers 工作流产物（SDD 中间产物：ledger/brief/review package/diff）
+.superpowers/
+
+# 临时 / 测试产物
+*.tgz
+.tmp/
+.temp/
+
+# 包管理器本地配置（仅提交 lock 文件）
+.pnpm-store/

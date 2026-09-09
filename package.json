@@ -1,0 +1,17 @@
+{
+  "name": "pi-plugins",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pi 插件集 monorepo",
+  "license": "MIT",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint"
+  },
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=8"
+  },
+  "packageManager": "pnpm@8.15.0"
+}
