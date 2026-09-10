@@ -1,7 +1,7 @@
-// scan/spring.ts —— Spring 专属：datasource / data.redis / elasticsearch 键映射 + profile 分组
+// scan/spring.ts —— Spring 专属：datasource / data.redis / elasticsearch / data.mongodb 键映射 + profile 分组
 import type { DbTypeId } from "../types.js";
 
-export type SpringGroup = "datasource" | "redis" | "es";
+export type SpringGroup = "datasource" | "redis" | "es" | "mongo";
 
 export interface RawDbConfig {
   group: SpringGroup;
@@ -45,11 +45,14 @@ const SPRING_KEYS: Array<[string, Field]> = [
   ["spring.data.elasticsearch.uris", "url"],
   ["spring.data.elasticsearch.username", "username"],
   ["spring.data.elasticsearch.password", "password"],
+  ["spring.data.mongodb.uri", "url"],       // Spring Boot 2.x+（含 3.x）
+  ["spring.mongodb.uri", "url"],            // Spring Boot 1.x 旧前缀
 ];
 
 function groupOf(key: string): SpringGroup {
   if (key.includes("redis")) return "redis";
   if (key.includes("elasticsearch")) return "es";
+  if (key.includes("mongodb")) return "mongo"; // 独立分组：避免与 datasource 的 url 字段互相覆盖
   return "datasource";
 }
 

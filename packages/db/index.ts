@@ -2,20 +2,22 @@ import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registry } from "./src/dialects/index.js";
-import { decide } from "./src/core/policy.js";
+import { decide, effectiveReadonly, writeRequiresReason } from "./src/core/policy.js";
+import { appendAuditLog } from "./src/core/audit.js";
 import { scanProject } from "./src/core/scan/candidates.js";
 import type { Candidate, ConnConfig, DbTypeId } from "./src/core/types.js";
 import {
   loadConfigs, saveConfigs, loadPluginConfig, savePluginConfig, getConfigSummary,
   findConfig, toRuntimeConfig, shortTypeLabel, fullTypeLabel,
   parseConnectionString, getDefaultConfig, setDefaultConfig, writeQueryExport,
+  recordLastUsed, recordTestResult, connSummaryLine, envTagLabel, formatRelativeTime,
 } from "./src/config.js";
 import type { PluginConfig } from "./src/config.js";
 
 // ── URL 解析：遍历 registry 各方言 parseUrl，首个非 null 胜出 ────
 // 关系型 JDBC + 原生 URI 双形态由各方言 parseUrl 兼收（Spec §7）
 
-function parseDbUrl(url: string): { dialectId: DbTypeId; host: string; port: number; username?: string; password?: string; database?: string; dbIndex?: number } | null {
+function parseDbUrl(url: string): { dialectId: DbTypeId; host: string; port: number; username?: string; password?: string; database?: string; dbIndex?: number; options?: Record<string, string> } | null {
   for (const d of registry.values()) {
     const p = d.parseUrl(url);
     if (p) return { dialectId: d.id, ...p };
@@ -37,9 +39,7 @@ function buildDisplayList(configs: ConnConfig[]): { list: string[]; map: Map<str
   const map = new Map<string, ConnConfig>();
   const list: string[] = [];
   for (const c of configs) {
-    const typeLabel = shortTypeLabel(c.type);
-    const desc = c.description ? ` - ${c.description}` : "";
-    const display = `${c.name} [${typeLabel}]${desc}`;
+    const display = connSummaryLine(c);
     list.push(display);
     map.set(display, c);
   }
@@ -56,6 +56,8 @@ function familyHint(c: ConnConfig): string {
     case "mysql":
     case "oracle":
       return "关系型，sql 参数填 SQL";
+    case "mongodb":
+      return "MongoDB 文档库，sql 参数填 JSON 命令信封（如 {\"find\":\"users\",\"filter\":{}}；读命令 find/count/distinct/aggregate）";
     default:
       return `${fullTypeLabel(c.type)}，sql 参数填查询或命令`;
   }
@@ -93,13 +95,15 @@ function buildDbListHint(configs: ConnConfig[], cfg: PluginConfig): string {
   }
   const lines = configs.map((c) => {
     const desc = c.description ? ` - ${c.description}` : "";
-    return `- ${c.name}[${shortTypeLabel(c.type)}] - ${fullTypeLabel(c.type)}，${familyHint(c)}${desc}`;
+    const tag = envTagLabel(c);
+    return `- ${c.name}[${shortTypeLabel(c.type)}]${tag ? " " + tag : ""} - ${fullTypeLabel(c.type)}，${familyHint(c)}${desc}`;
   });
   return [
     "[数据库工具执行策略]",
     policy,
     confirmation,
     safety,
+    "标注 [prod·强制只读] 的连接无论全局只读设置如何均只允许查询。",
     "[可用数据库]",
     ...lines,
     "query_database / list_tables / describe_table 的 database 参数必须使用上述名称（不含中括号内容，名称区分大小写）。",
@@ -209,6 +213,7 @@ export default function (pi: ExtensionAPI) {
       const idx = all.findIndex((x) => x.name === name);
       if (idx >= 0) all[idx] = conn; else all.push(conn);
       saveConfigs(all);
+      recordTestResult(name, result);
       ctx.ui.notify(`配置已保存: ${name}`, "success");
     }
   };
@@ -218,12 +223,40 @@ export default function (pi: ExtensionAPI) {
     const name = (await ctx.ui.input("连接名称", ""))?.trim();
     if (!name) { ctx.ui.notify("连接名称不能为空", "error"); return; }
 
-    // 首问：一键连接串 / 逐步填写
+    // 首问：一键连接串 / 逐步填写 / 从现有复制（v1.1 UX 共识 Q2）
     const mode = await ctx.ui.select("添加方式", [
       "⚡ 粘贴连接串（一键）",
       "📝 逐步填写",
+      "📋 从现有复制",
     ]);
     if (!mode) return;
+
+    if (mode === "📋 从现有复制") {
+      const source = await selectDbConfig(ctx, loadConfigs(), "选择要复制的连接");
+      if (!source) return;
+      let newName = (await ctx.ui.input("新连接名称", `${source.name}-copy`))?.trim();
+      while (newName && loadConfigs().some((c) => c.name === newName)) {
+        newName = (await ctx.ui.input(`名称已存在: ${newName}，请换一个`, `${newName}-2`))?.trim();
+      }
+      if (!newName) { ctx.ui.notify("已取消复制", "info"); return; }
+      const copy: ConnConfig = {
+        ...source,
+        id: randomUUID(),
+        name: newName,
+        isDefault: false,
+        lastUsedAt: undefined,
+        lastTest: undefined,
+        createdAt: new Date().toISOString(),
+      };
+      const all = loadConfigs();
+      all.push(copy);
+      saveConfigs(all);
+      ctx.ui.notify(`已复制为 ${newName}（类型/账号/环境标签等设置一并带上）`, "success");
+      if (await ctx.ui.confirm("从现有复制", "立即编辑副本（主机/端口/库/标签等）？")) {
+        await editDbConfig(ctx, copy);
+      }
+      return;
+    }
 
     let parsed: ReturnType<typeof parseDbUrl>;
     let username = "";
@@ -231,19 +264,19 @@ export default function (pi: ExtensionAPI) {
     let dbIndex: number | undefined;
 
     if (mode === "⚡ 粘贴连接串（一键）") {
-      const url = (await ctx.ui.input("连接串", "postgresql://user:pass@host:5432/db 或 jdbc:mysql://... 或 redis://:pass@host:6379/0"))?.trim();
+      const url = (await ctx.ui.input("连接串", "postgresql://user:pass@host:5432/db 或 jdbc:mysql://... 或 redis://:pass@host:6379/0 或 mongodb://user:pass@host:27017/db"))?.trim();
       if (!url) { ctx.ui.notify("连接串不能为空", "error"); return; }
       const pcs = parseConnectionString(url);
       if (!pcs) {
-        ctx.ui.notify("连接串无法识别。支持: postgresql/mysql/oracle/dm/hive JDBC、redis(s)://、http(s)://host:9200", "error");
+        ctx.ui.notify("连接串无法识别。支持: postgresql/mysql/oracle/dm/hive JDBC、redis(s)://、mongodb(srv)://、http(s)://host:9200", "error");
         return;
       }
-      parsed = { dialectId: pcs.dialectId, host: pcs.host, port: pcs.port, database: pcs.database };
+      parsed = { dialectId: pcs.dialectId, host: pcs.host, port: pcs.port, database: pcs.database, options: pcs.options };
       username = pcs.username ?? "";
       password = pcs.password ?? "";
       dbIndex = pcs.dbIndex;
     } else {
-      const url = (await ctx.ui.input("连接 URL", "jdbc:postgresql://host:port/database"))?.trim();
+      const url = (await ctx.ui.input("连接 URL", "jdbc:postgresql://host:port/database 或 mongodb://host:27017/db"))?.trim();
       if (!url) { ctx.ui.notify("连接 URL 不能为空", "error"); return; }
       const pcs = parseConnectionString(url);
       if (!pcs) {
@@ -251,17 +284,21 @@ export default function (pi: ExtensionAPI) {
           "  PostgreSQL/MySQL/DM/Hive: jdbc:<dialect>://host:port/db\n" +
           "  Oracle:     jdbc:oracle:thin:@//host:port/service 或 @host:port:SID\n" +
           "  Redis:      redis://[:password@]host:port[/db]\n" +
+          "  MongoDB:    mongodb://user:pass@host:27017/db 或 mongodb+srv://...\n" +
           "  ES:         http://host:9200", "error");
         return;
       }
-      parsed = { dialectId: pcs.dialectId, host: pcs.host, port: pcs.port, database: pcs.database };
+      parsed = { dialectId: pcs.dialectId, host: pcs.host, port: pcs.port, database: pcs.database, options: pcs.options };
       dbIndex = pcs.dbIndex;
 
-      // 家族分支字段：Redis 无账号要求、需库号；ES 账号/密码；其余 URL+账号+密码
+      // 家族分支字段：Redis 无账号要求、需库号；MongoDB 账号可空；ES/其余 账号+密码
       if (parsed.dialectId === "redis") {
         password = (await ctx.ui.input("密码（可空）", ""))?.trim() ?? "";
         const idxInput = (await ctx.ui.input("库号 dbIndex（0-15，缺省 0）", String(dbIndex ?? 0)))?.trim();
         dbIndex = idxInput !== undefined && idxInput !== "" ? parseInt(idxInput, 10) : dbIndex;
+      } else if (parsed.dialectId === "mongodb") {
+        username = (await ctx.ui.input("账号（可空，本地无认证留空）", ""))?.trim() ?? "";
+        password = (await ctx.ui.input("密码（可空）", ""))?.trim() ?? "";
       } else {
         username = (await ctx.ui.input("账号", "root"))?.trim() || "root";
         password = (await ctx.ui.input("密码", ""))?.trim() ?? "";
@@ -286,6 +323,20 @@ export default function (pi: ExtensionAPI) {
     }
     ctx.ui.notify(`连接成功 (${result.version}, ${result.latency})`, "success");
 
+    // 环境标签（v1.1 UX 共识 Q3）：测试通过后再问，失败不浪费输入；prod 主动建议强制只读
+    let envTag: ConnConfig["envTag"];
+    let forceReadonly: boolean | undefined;
+    const envChoice = await ctx.ui.select("环境标签（可跳过）", ["跳过", "dev", "test", "prod"]);
+    if (envChoice && envChoice !== "跳过") {
+      envTag = envChoice as ConnConfig["envTag"];
+      if (envTag === "prod") {
+        forceReadonly = await ctx.ui.confirm(
+          "生产库安全建议",
+          "将此连接设为强制只读？\n开启后该连接无视全局只读开关，永远只接受查询（生产库建议开启）。",
+        );
+      }
+    }
+
     const configs = loadConfigs();
     if (configs.some((c) => c.name === name)) {
       ctx.ui.notify(`已存在同名配置: ${name}`, "error");
@@ -303,13 +354,17 @@ export default function (pi: ExtensionAPI) {
       password,
       database: parsed.database,
       dbIndex,
+      options: parsed.options,
+      envTag,
+      forceReadonly,
       isDefault: configs.length === 0, // 首个连接自动设为默认（与提示文案一致）
       createdAt: new Date().toISOString(),
     };
 
     configs.push(config);
     saveConfigs(configs);
-    ctx.ui.notify(`配置已保存: ${name}${configs.length === 1 ? "（首个连接已设为默认）" : ""}`, "success");
+    recordTestResult(name, result);
+    ctx.ui.notify(`配置已保存: ${name}${envTag ? ` [${envTag}${forceReadonly ? "·强制只读" : ""}]` : ""}${configs.length === 1 ? "（首个连接已设为默认）" : ""}`, "success");
   };
 
   // ── 编辑数据库连接 ──────────────────────────────
@@ -320,6 +375,8 @@ export default function (pi: ExtensionAPI) {
       `URL: ${currentUrl}`,
       `账号: ${original.username}`,
       `密码: ${original.password || ""}`,
+      `环境标签: ${original.envTag ?? ""}`,
+      `强制只读: ${original.forceReadonly ? "是" : "否"}`,
       `说明: ${original.description || ""}`,
     ].join("\n");
 
@@ -353,6 +410,14 @@ export default function (pi: ExtensionAPI) {
     const descRaw = getValue("说明");
     const description = descRaw === "" ? undefined : (descRaw || original.description);
 
+    // 环境标签/强制只读（行缺省=保持原值；标签仅接受 dev/test/prod，其余/清空=去除标签）
+    const envRaw = getValue("环境标签")?.trim().toLowerCase();
+    const envTag = envRaw === undefined || envRaw === ""
+      ? (envRaw === "" ? undefined : original.envTag)
+      : (["dev", "test", "prod"].includes(envRaw) ? envRaw as ConnConfig["envTag"] : original.envTag);
+    const roRaw = getValue("强制只读")?.trim();
+    const forceReadonly = roRaw === undefined ? original.forceReadonly : roRaw === "是";
+
     const updated: ConnConfig = {
       ...original,
       name,
@@ -362,6 +427,9 @@ export default function (pi: ExtensionAPI) {
       username,
       password,
       database: parsed.database,
+      options: parsed.options ?? original.options, // displayUrl 不带查询参数，保留原 options（authSource 等）
+      envTag,
+      forceReadonly,
       description,
     };
 
@@ -379,6 +447,18 @@ export default function (pi: ExtensionAPI) {
     all[idx] = updated;
     saveConfigs(all);
     ctx.ui.notify(`已更新: ${updated.name}`, "success");
+
+    // 编辑后自动回测（v1.1 UX 共识 Q1）：结果回写 lastTest，不阻塞保存
+    const testDialect = registry.get(updated.type)!;
+    ctx.ui.notify(`正在测试 ${testDialect.label} 连接...`, "info");
+    const test = await testDialect.testConnection(toRuntimeConfig(updated, testDialect.defaultPort));
+    recordTestResult(updated.name, test);
+    ctx.ui.notify(
+      test.success
+        ? `✓ 连接正常 (${test.version ?? "?"}, ${test.latency ?? "?"})`
+        : `⚠ 已保存，但连接测试失败: ${test.error}`,
+      test.success ? "success" : "error",
+    );
   };
 
   // ── 选择数据库公共操作 ────────────────────────────
@@ -398,10 +478,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify("尚无数据库连接", "info");
       return;
     }
-    const lines = configs.map((c) => {
-      const desc = c.description ? ` - ${c.description}` : "";
-      return `  ${c.name} [${shortTypeLabel(c.type)}]${desc}`;
-    });
+    const lines = configs.map((c) => `  ${connSummaryLine(c)}`);
     ctx.ui.notify(`数据库连接 (${configs.length}):\n${lines.join("\n")}`, "info");
   };
 
@@ -423,6 +500,7 @@ export default function (pi: ExtensionAPI) {
       "📝 执行查询",
       "📋 列出表",
       "🔍 查看详情",
+      "🧪 测试连接",
       config.isDefault ? "⭐ 取消默认" : "⭐ 设为默认",
       "✏️ 编辑",
       "🗑️ 删除",
@@ -441,8 +519,9 @@ export default function (pi: ExtensionAPI) {
       if (!sql) return;
       const cfg = loadPluginConfig();
       const dialect = registry.get(config.type)!;
-      const verdict = dialect.isAllowed(sql, cfg.ai_readonly);
-      const action = decide(verdict, cfg.ai_readonly, cfg.confirm_before_exec);
+      const effRo = effectiveReadonly(cfg.ai_readonly, config); // 连接级强制只读生效（v1.2 Q3）
+      const verdict = dialect.isAllowed(sql, effRo);
+      const action = decide(verdict, effRo, cfg.confirm_before_exec);
       if (action === "deny") {
         ctx.ui.notify(`不允许执行: ${verdict.reason}`, "error");
         continue;
@@ -456,9 +535,10 @@ export default function (pi: ExtensionAPI) {
       }
       ctx.ui.notify("正在执行查询...", "info");
       const result = await dialect.executeOn(toRuntimeConfig(config, dialect.defaultPort), sql, {
-        readonly: cfg.ai_readonly, maxRows: cfg.max_rows, timeoutSec: cfg.query_timeout,
+        readonly: effRo, maxRows: cfg.max_rows, timeoutSec: cfg.query_timeout,
       });
       if (result.success) {
+        recordLastUsed(config.name);
         const lines = [`查询完成 (${result.duration})`, `返回 ${result.rowCount} 行`];
         if (result.columns && result.columns.length > 0) {
           lines.push("列: " + result.columns.join(", "));
@@ -483,6 +563,18 @@ export default function (pi: ExtensionAPI) {
       } else {
         ctx.ui.notify(`查询失败: ${result.error}`, "error");
       }
+    } else if (choice === "🧪 测试连接") {
+      const dialect = registry.get(config.type)!;
+      ctx.ui.notify(`正在测试 ${dialect.label} 连接...`, "info");
+      const result = await dialect.testConnection(toRuntimeConfig(config, dialect.defaultPort));
+      recordTestResult(config.name, result);
+      ctx.ui.notify(
+        result.success
+          ? `✓ 连接正常 (${result.version ?? "?"}, ${result.latency ?? "?"})`
+          : `✗ 连接失败: ${result.error}`,
+        result.success ? "success" : "error",
+      );
+      continue;
     } else if (choice === "📋 列出表") {
       const dialect = registry.get(config.type)!;
       const result = await dialect.listTables(toRuntimeConfig(config, dialect.defaultPort));
@@ -555,6 +647,12 @@ export default function (pi: ExtensionAPI) {
         label: "查询超时(s)",
         current: String(cfg.query_timeout),
       },
+      {
+        key: "audit_enabled" as const,
+        label: "审计日志",
+        current: cfg.audit_enabled ? "是" : "否",
+        options: ["是", "否"],
+      },
     ];
 
     // 选择要修改的字段
@@ -596,7 +694,7 @@ export default function (pi: ExtensionAPI) {
       const updatedFields = fields.map((f) => {
         const val = (newCfg as any)[f.key];
         const display =
-          f.key === "ai_readonly" ? (val ? "是" : "否") :
+          f.key === "ai_readonly" || f.key === "audit_enabled" ? (val ? "是" : "否") :
           f.key === "confirm_before_exec" ?
             (val === "never" ? "不确认" : val === "write" ? "写操作确认" : "每次都确认") :
             String(val);
@@ -644,13 +742,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "query_database",
     label: "数据库查询",
-    description: "执行 SQL 语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / Hive / Spark 八种数据库，返回执行结果。支持读和写，写操作受确认策略约束；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。",
-    promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；database 参数取系统提示「可用数据库」列表中的名称（缺省走默认连接）。使用 list_tables 查看表结构后再编写 SQL。",
+    description: "执行 SQL 语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / MongoDB / Hive / Spark 九种数据库，返回执行结果。支持读和写，写操作受确认策略约束且必须附 reason 执行理由（动机+影响范围），用户确认框将展示该理由；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。MongoDB 的 sql 参数填 JSON 命令信封（db.runCommand 形态，如 {\"find\":\"users\",\"filter\":{}}）。",
+    promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；写操作必须在 reason 参数说明动机与影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"），否则会被拒绝。database 参数取系统提示「可用数据库」列表中的名称（缺省走默认连接）。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
       database: Type.Optional(Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称；缺省走默认连接）" })),
-      sql: Type.String({ description: "SQL 语句" }),
+      sql: Type.String({ description: "SQL 语句；MongoDB 填 JSON 命令信封，Redis 填命令，ES 填 DSL" }),
+      reason: Type.Optional(Type.String({ description: "执行理由，写操作必填：动机+影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"）。读操作无需填写" })),
     }),
-    async execute(_toolCallId: string, params: { database?: string; sql: string }, _signal: any, _onUpdate?: any, ctx?: any) {
+    async execute(_toolCallId: string, params: { database?: string; sql: string; reason?: string }, _signal: any, _onUpdate?: any, ctx?: any) {
       const cfg = loadPluginConfig();
 
       const target = resolveTargetDb(params.database);
@@ -661,6 +760,9 @@ export default function (pi: ExtensionAPI) {
       }
       const config = target.config;
 
+      // 生效只读 = 全局只读 ∨ 连接级强制只读（v1.1 UX 共识 Q3）
+      const effectiveReadOnly = effectiveReadonly(cfg.ai_readonly, config);
+
       // verdict 流程（策略层统一裁决，含 DROP 硬限制与只读检查）：
       // verdict = dialect.isAllowed(sql, readonly) → decide → deny/confirm/run
       const dialect = registry.get(config.type);
@@ -669,11 +771,20 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: `数据库类型 "${config.type}" 暂不支持。` }],
         };
       }
-      const verdict = dialect.isAllowed(params.sql, cfg.ai_readonly);
-      const action = decide(verdict, cfg.ai_readonly, cfg.confirm_before_exec);
+      const verdict = dialect.isAllowed(params.sql, effectiveReadOnly);
+      const action = decide(verdict, effectiveReadOnly, cfg.confirm_before_exec);
       if (action === "deny") {
+        const note = !cfg.ai_readonly && config.forceReadonly === true
+          ? `（连接 ${config.name} 已设置强制只读）`
+          : "";
         return {
-          content: [{ type: "text" as const, text: verdict.reason ?? "该操作不被允许。如需修改，请执行 /db config 更改配置。" }],
+          content: [{ type: "text" as const, text: (verdict.reason ?? "该操作不被允许。如需修改，请执行 /db config 更改配置。") + note }],
+        };
+      }
+      // 写操作强制附执行理由（v1.1 UX 共识 Q1/Q3：与确认策略解耦；缺 reason 拒绝并引导 AI 补充）
+      if (writeRequiresReason(verdict, params.reason)) {
+        return {
+          content: [{ type: "text" as const, text: "写操作必须附执行理由：请在 reason 参数中说明动机与影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"），补充后重试。" }],
         };
       }
       if (action === "confirm") {
@@ -684,7 +795,7 @@ export default function (pi: ExtensionAPI) {
         }
         const ok = await ctx.ui.confirm(
           "SQL 执行确认",
-          `${verdict.summary ?? ""}\n\n数据库: ${config.name}\n\nSQL:\n${params.sql}`,
+          `理由: ${params.reason}\n\n${verdict.summary ?? ""}\n\n数据库: ${config.name}\n\nSQL:\n${params.sql}`,
         );
         if (!ok) {
           return {
@@ -697,7 +808,7 @@ export default function (pi: ExtensionAPI) {
       const result = await dialect.executeOn(
         toRuntimeConfig(config, dialect.defaultPort),
         params.sql,
-        { readonly: cfg.ai_readonly, maxRows: cfg.max_rows, timeoutSec: cfg.query_timeout },
+        { readonly: effectiveReadOnly, maxRows: cfg.max_rows, timeoutSec: cfg.query_timeout },
       );
 
       if (!result.success) {
@@ -706,6 +817,20 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
+      recordLastUsed(config.name);
+      // 写操作审计（v1.1 UX 共识 Q4 + 可配置修订：默认关闭，cfg.audit_enabled 开启才落盘；失败不阻断主流程）
+      if (verdict.isWrite && cfg.audit_enabled) {
+        appendAuditLog({
+          time: new Date().toISOString(),
+          project: process.cwd(),
+          connection: config.name,
+          type: config.type,
+          summary: verdict.summary ?? "",
+          reason: (params.reason ?? "").trim(),
+          sql: params.sql,
+          readonly: effectiveReadOnly,
+        });
+      }
       let text = `查询完成 (${result.duration})，返回 ${result.rowCount} 行\n`;
       if (result.columns && result.columns.length > 0) {
         text += `列: ${result.columns.join(", ")}\n\n`;
@@ -729,6 +854,10 @@ export default function (pi: ExtensionAPI) {
         }
       } else {
         text += "无数据返回。";
+      }
+      // 写操作理由随结果回显（v1.1 UX 共识 Q2：说了什么→做了什么闭环）
+      if (verdict.isWrite) {
+        text += `\n执行理由: ${params.reason}`;
       }
 
       return { content: [{ type: "text" as const, text }] };
@@ -767,6 +896,7 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: `获取表列表失败: ${result.error}` }],
         };
       }
+      recordLastUsed(config.name);
 
       const lines = result.tables.map((t) => {
         const schema = t.schema ? `${t.schema}.` : "";
@@ -812,6 +942,7 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: `获取表结构失败: ${result.error}` }],
         };
       }
+      recordLastUsed(config.name);
 
       const lines = [`表: ${params.table}`, `共 ${result.count} 列\n`];
       // 表头
@@ -861,6 +992,35 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // 工具 5: db_connections（v1.1 UX 共识 Q5：AI 自查连接清单与环境标签，识别生产库）
+  pi.registerTool({
+    name: "db_connections",
+    label: "列出数据库连接",
+    description: "列出所有已配置的数据库连接（名称/类型/环境标签/默认标记/最近测试结果/连接地址，不含密码）。用于确认可用连接、识别生产库。增删改连接需用户在终端执行 /db。",
+    promptSnippet: "当用户提到某个环境（如“生产库”）或不确定该用哪个连接时，先调用本工具确认连接清单再查询；database 参数应使用返回列表中的名称。",
+    parameters: Type.Object({}),
+    async execute() {
+      const configs = loadConfigs();
+      if (configs.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "尚无数据库连接。请引导用户在终端执行 /db add 或 /db scan 建连。" }],
+        };
+      }
+      const lines = configs.map((c) => {
+        const marks = [c.isDefault ? "⭐默认" : "", envTagLabel(c)].filter(Boolean).join(" ");
+        const test = c.lastTest
+          ? `测试 ${formatRelativeTime(c.lastTest.at)} ${c.lastTest.ok ? "✓" : "✗"}${c.lastTest.latency ? " " + c.lastTest.latency : ""}${c.lastTest.version ? " · " + c.lastTest.version : ""}`
+          : "未测试";
+        const used = c.lastUsedAt ? `上次使用 ${formatRelativeTime(c.lastUsedAt)}` : "";
+        const url = registry.get(c.type)?.displayUrl(c) ?? "";
+        return `- ${c.name} [${shortTypeLabel(c.type)}]${marks ? " " + marks : ""} - ${fullTypeLabel(c.type)}${c.database ? " · 库: " + c.database : ""} · ${url} · ${test}${used ? " · " + used : ""}${c.description ? " · " + c.description : ""}`;
+      });
+      return {
+        content: [{ type: "text" as const, text: `共 ${configs.length} 个连接：\n${lines.join("\n")}\n\n标注 [prod·强制只读] 的连接永远只读（即使全局允许写操作）。` }],
+      };
+    },
+  });
+
   // ── 注册 /db 命令（给用户管理连接） ──────────────
   pi.registerCommand("db", {
     description: "AI 接入数据库",
@@ -872,6 +1032,7 @@ export default function (pi: ExtensionAPI) {
         // 导航菜单：查看 / 编辑 / 新增 / 删除 / 设置
         const navActions = [
           "📋 打开连接",
+          "⚡ 切换默认",
           "✏️ 编辑连接",
           "➕ 新增连接",
           "🔎 扫描建连",
@@ -886,6 +1047,22 @@ export default function (pi: ExtensionAPI) {
         } else if (navChoice === "📋 打开连接") {
           const config = await selectDbConfig(ctx, configs, "选择连接");
           if (config) await showDbActions(ctx, config);
+        } else if (navChoice === "⚡ 切换默认") {
+          // v1.1 UX 共识 Q1：两层直达，替代“打开→动作→设为默认”三层路径
+          const configsNow = loadConfigs();
+          if (configsNow.length === 0) {
+            ctx.ui.notify("尚无数据库连接", "info");
+          } else {
+            const target = await selectDbConfig(ctx, configsNow, "设为默认连接（⭐ 为当前默认）");
+            if (target) {
+              if (target.isDefault) {
+                ctx.ui.notify(`已是默认连接: ${target.name}`, "info");
+              } else {
+                saveConfigs(setDefaultConfig(configsNow, target.id));
+                ctx.ui.notify(`默认连接已切换: ${target.name}`, "success");
+              }
+            }
+          }
         } else if (navChoice === "✏️ 编辑连接") {
           const config = await selectDbConfig(ctx, configs, "选择要编辑的连接");
           if (config) await editDbConfig(ctx, config);

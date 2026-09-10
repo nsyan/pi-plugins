@@ -8,5 +8,6 @@ export { oracleDialect } from "./oracle.js";
 export { dmDialect } from "./dm.js";
 export { redisDialect } from "./redis.js";
 export { esDialect } from "./elasticsearch.js";
+export { mongoDialect } from "./mongodb.js";
 export { hiveDialect } from "./hive.js";
 export { sparkDialect } from "./spark.js";

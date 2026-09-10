@@ -20,6 +20,7 @@ interface FieldBag {
   username?: string; password?: string;
   database?: string; dbIndex?: number;
   ssl?: boolean;
+  options?: Record<string, string>;
   url?: string;
 }
 
@@ -41,6 +42,7 @@ const REQUIRED: Record<DbTypeId, string[]> = {
   spark: ["host", "port", "database", "username"],
   redis: ["host", "port", "password"],
   elasticsearch: ["host", "port"],
+  mongodb: ["host", "port"], // 账号/工作库可选（本地无认证常见）
 };
 
 // ── 工具函数 ──────────────────────────────────────
@@ -78,6 +80,7 @@ function dialectFromImage(image: string): DbTypeId | null {
   const i = image.toLowerCase();
   if (/postgres/.test(i)) return "postgresql";
   if (/(^|\/)(mysql|mariadb)/.test(i)) return "mysql";
+  if (/(^|\/)mongo/.test(i)) return "mongodb"; // mongo / mongodb 镜像（mongo-express 误报可忍变）
   if (/redis/.test(i)) return "redis";
   if (/elasticsearch/.test(i)) return "elasticsearch";
   if (/dm8|dameng/.test(i)) return "dm";
@@ -109,7 +112,9 @@ export async function scanProject(
   const dirEnvCache = new Map<string, Record<string, string> | undefined>();
 
   const pushUrl = (url: string, file: string, profile: string, confidence: number, keyFields?: Partial<RawDbConfig>): void => {
-    const parsed = parseUrlViaRegistry(stripQuery(url));
+    // 先用完整 URL 路由（MongoDB 的 authSource/replicaSet 等在 query 里，不能剥）；
+    // 失败再回退剥离 query 的旧路径（兼容 JDBC 带查询参数时各 parseUrl 的锚点匹配）
+    const parsed = parseUrlViaRegistry(url) ?? parseUrlViaRegistry(stripQuery(url));
     if (!parsed) return;
     raws.push({
       dialectId: parsed.dialectId,
@@ -123,6 +128,7 @@ export async function scanProject(
         database: parsed.database,
         dbIndex: parsed.dbIndex,
         ssl: parsed.ssl,
+        options: parsed.options,
       },
       file, profile, confidence,
     });
@@ -160,7 +166,7 @@ export async function scanProject(
     if (base === ".env" || base.startsWith(".env.")) {
       const env = parseEnv(text);
       for (const [k, v] of Object.entries(env)) {
-        if (/(^|_)(DATABASE_URL|DATASOURCE_URL|REDIS_URL|ELASTICSEARCH_URL|DB_URL|JDBC_URL)$|_URL$/i.test(k)) {
+        if (/(^|_)(DATABASE_URL|DATASOURCE_URL|REDIS_URL|ELASTICSEARCH_URL|MONGODB_URI|MONGO_URL|DB_URL|JDBC_URL)$|_URL$/i.test(k)) {
           pushUrl(v, file, profile, weight);
         }
       }
@@ -175,9 +181,9 @@ export async function scanProject(
           const bag: FieldBag = {
             host: svc.name, // compose 网络内服务名即主机名
             port: hostPortOf(svc.ports),
-            username: svc.env["POSTGRES_USER"] ?? svc.env["MYSQL_USER"] ?? svc.env["ES_USERNAME"],
-            password: svc.env["POSTGRES_PASSWORD"] ?? svc.env["MYSQL_ROOT_PASSWORD"] ?? svc.env["MYSQL_PASSWORD"] ?? svc.env["REDIS_PASSWORD"] ?? svc.env["ELASTIC_PASSWORD"],
-            database: svc.env["POSTGRES_DB"] ?? svc.env["MYSQL_DATABASE"],
+            username: svc.env["POSTGRES_USER"] ?? svc.env["MYSQL_USER"] ?? svc.env["ES_USERNAME"] ?? svc.env["MONGO_INITDB_ROOT_USERNAME"],
+            password: svc.env["POSTGRES_PASSWORD"] ?? svc.env["MYSQL_ROOT_PASSWORD"] ?? svc.env["MYSQL_PASSWORD"] ?? svc.env["REDIS_PASSWORD"] ?? svc.env["ELASTIC_PASSWORD"] ?? svc.env["MONGO_INITDB_ROOT_PASSWORD"],
+            database: svc.env["POSTGRES_DB"] ?? svc.env["MYSQL_DATABASE"] ?? svc.env["MONGO_INITDB_DATABASE"],
           };
           raws.push({ dialectId, bag, file, profile, confidence: weight });
           // compose 里也可能带完整 Spring URL
