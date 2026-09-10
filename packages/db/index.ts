@@ -644,7 +644,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "query_database",
     label: "数据库查询",
-    description: "执行 SQL 语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / Hive / Spark 八种数据库，返回执行结果。实际是否允许写操作以及是否需要确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。",
+    description: "执行 SQL 语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / Hive / Spark 八种数据库，返回执行结果。支持读和写，写操作受确认策略约束；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。",
     promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；database 参数取系统提示「可用数据库」列表中的名称（缺省走默认连接）。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
       database: Type.Optional(Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称；缺省走默认连接）" })),
