@@ -138,7 +138,7 @@ export function parseCompose(text: string): ComposeService[] {
 
 // ── 通用 URL 正则（全文件扫描兜底）──────────────────
 
-const URL_RE = /(?:jdbc:(?:postgresql|mysql|oracle|dm|hive2)|rediss?|mongodb\+srv|mongodb|postgresql|mysql):\/\/[^\s"'<>`]+|https?:\/\/[^\s"'<>`]*:9200[^\s"'<>`]*/g;
+const URL_RE = /(?:jdbc:(?:postgresql|mysql|oracle|dm|hive2)|rediss?|mongodb\+srv|mongodb|neo4j\+s(sc)?|neo4j|bolt\+s(sc)?|bolt|postgresql|mysql):\/\/[^\s"'<>`]+|https?:\/\/[^\s"'<>`]*:9200[^\s"'<>`]*/g;
 
 export function extractUrls(text: string): string[] {
   const out = new Set<string>();

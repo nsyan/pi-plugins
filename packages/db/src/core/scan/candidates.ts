@@ -42,6 +42,7 @@ const REQUIRED: Record<DbTypeId, string[]> = {
   spark: ["host", "port", "database", "username"],
   redis: ["host", "port", "password"],
   elasticsearch: ["host", "port"],
+  neo4j: ["host", "port", "username", "password"], // 工作库可选（缺省 neo4j；社区版默认开认证）
   mongodb: ["host", "port"], // 账号/工作库可选（本地无认证常见）
 };
 
@@ -82,6 +83,7 @@ function dialectFromImage(image: string): DbTypeId | null {
   if (/(^|\/)(mysql|mariadb)/.test(i)) return "mysql";
   if (/(^|\/)mongo/.test(i)) return "mongodb"; // mongo / mongodb 镜像（mongo-express 误报可忍变）
   if (/redis/.test(i)) return "redis";
+  if (/neo4j/.test(i)) return "neo4j";
   if (/elasticsearch/.test(i)) return "elasticsearch";
   if (/dm8|dameng/.test(i)) return "dm";
   if (/hive/.test(i)) return "hive";
@@ -166,7 +168,7 @@ export async function scanProject(
     if (base === ".env" || base.startsWith(".env.")) {
       const env = parseEnv(text);
       for (const [k, v] of Object.entries(env)) {
-        if (/(^|_)(DATABASE_URL|DATASOURCE_URL|REDIS_URL|ELASTICSEARCH_URL|MONGODB_URI|MONGO_URL|DB_URL|JDBC_URL)$|_URL$/i.test(k)) {
+        if (/(^|_)(DATABASE_URL|DATASOURCE_URL|REDIS_URL|ELASTICSEARCH_URL|MONGODB_URI|MONGO_URL|NEO4J_URI|NEO4J_URL|BOLT_URL|DB_URL|JDBC_URL)$|_URL$/i.test(k)) {
           pushUrl(v, file, profile, weight);
         }
       }
@@ -181,8 +183,8 @@ export async function scanProject(
           const bag: FieldBag = {
             host: svc.name, // compose 网络内服务名即主机名
             port: hostPortOf(svc.ports),
-            username: svc.env["POSTGRES_USER"] ?? svc.env["MYSQL_USER"] ?? svc.env["ES_USERNAME"] ?? svc.env["MONGO_INITDB_ROOT_USERNAME"],
-            password: svc.env["POSTGRES_PASSWORD"] ?? svc.env["MYSQL_ROOT_PASSWORD"] ?? svc.env["MYSQL_PASSWORD"] ?? svc.env["REDIS_PASSWORD"] ?? svc.env["ELASTIC_PASSWORD"] ?? svc.env["MONGO_INITDB_ROOT_PASSWORD"],
+            username: svc.env["POSTGRES_USER"] ?? svc.env["MYSQL_USER"] ?? svc.env["ES_USERNAME"] ?? svc.env["MONGO_INITDB_ROOT_USERNAME"] ?? svc.env["NEO4J_AUTH"]?.split("/")[0],
+            password: svc.env["POSTGRES_PASSWORD"] ?? svc.env["MYSQL_ROOT_PASSWORD"] ?? svc.env["MYSQL_PASSWORD"] ?? svc.env["REDIS_PASSWORD"] ?? svc.env["ELASTIC_PASSWORD"] ?? svc.env["MONGO_INITDB_ROOT_PASSWORD"] ?? svc.env["NEO4J_PASSWORD"],
             database: svc.env["POSTGRES_DB"] ?? svc.env["MYSQL_DATABASE"] ?? svc.env["MONGO_INITDB_DATABASE"],
           };
           raws.push({ dialectId, bag, file, profile, confidence: weight });

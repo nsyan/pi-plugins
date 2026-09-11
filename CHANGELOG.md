@@ -2,6 +2,21 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-09-12
+
+### Added（packages/db）
+
+**Neo4j 支持（graph 家族，第十种数据库、第六家族）**：
+
+- `query_database` 的 `sql` 参数接受 Cypher 原文，支持分号分隔多语句（逐条执行取最后一条结果，对齐关系型方言）
+- 驱动 `neo4j-driver@^5.28`（纯 JS 零原生编译）；按官方兼容矩阵声明 server **4.4 ~ 2025.x**，已验证 **4.4.29 community** 真连冒烟
+- 连接串支持 `bolt://`/`neo4j://` 及 `+s`/`+ssc` TLS 变体；建连统一 Bolt 直连——单机社区版无路由服务，`neo4j://` 路由 scheme 会报 No routing servers available；URL 路径段 = 图数据库名（缺省 `neo4j`）
+- 图结构语义：`list_tables` 返回 node label（NODE LABEL）+ 关系类型（RELATIONSHIP，`rel:` 前缀）；`describe_table` 目标填 label 名或 `rel:类型`，返回实体计数 + `SHOW INDEXES/CONSTRAINTS` + 采样 ≤100 推断属性键（对齐 Mongo Q5 共识；只依赖核心过程，不依赖 APOC）
+- 安全（Cypher 读写分类器）：CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP/FOREACH/LOAD CSV 任意深度出现即按写（读外壳夹写拦得住）；字符串字面量/注释/反引号标识符内写词不误判；`CALL dbms.*` 管理过程**恒拒**；未知 CALL 过程（含 apoc.*）保守按写；SHOW 类目白名单
+- 体验：Node/Relationship/Path 结果拍平为展示原语；无返回记录的写语句回显变更计数；limit 客户端截断对齐关系型方言
+- 扫描建连：Spring `spring.neo4j.uri`（Boot 3）/ `spring.data.neo4j.uri`（Boot 2）+ authentication 账号密码键、`.env` `NEO4J_URI`/`NEO4J_URL`/`BOLT_URL`、docker-compose `neo4j` 镜像、通用 URL 正则补 bolt/neo4j scheme
+- 反引号引用 Cypher 标识符（数字名 label 如 `0` 可安全查询）
+
 ## [规划中]
 
 来源：MCP 生态调研中识别但暂不实现的高价值项——

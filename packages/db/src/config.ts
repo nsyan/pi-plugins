@@ -276,9 +276,9 @@ export function toRuntimeConfig(c: ConnConfig, defaultPort: number): ConnConfig 
 
 // 供 UI 层展示类型短标签（原 index.ts 内 5 处重复映射的收敛点之一）
 export function shortTypeLabel(type: DbTypeId): string {
-  return ({ postgresql: "PG", mysql: "MySQL", oracle: "Oracle", mongodb: "MongoDB" } as Record<string, string>)[type] ?? type;
+  return ({ postgresql: "PG", mysql: "MySQL", oracle: "Oracle", mongodb: "MongoDB", neo4j: "Neo4j" } as Record<string, string>)[type] ?? type;
 }
 
 export function fullTypeLabel(type: DbTypeId): string {
-  return ({ postgresql: "PostgreSQL", mysql: "MySQL", oracle: "Oracle", mongodb: "MongoDB" } as Record<string, string>)[type] ?? type;
+  return ({ postgresql: "PostgreSQL", mysql: "MySQL", oracle: "Oracle", mongodb: "MongoDB", neo4j: "Neo4j" } as Record<string, string>)[type] ?? type;
 }

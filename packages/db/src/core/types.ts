@@ -1,14 +1,14 @@
 // core/types.ts
 export type DbTypeId = "postgresql" | "mysql" | "oracle" | "dm"
-  | "redis" | "elasticsearch" | "mongodb" | "hive" | "spark";
-export type DbFamily = "relational" | "kv" | "search" | "document" | "bigdata";
+  | "redis" | "elasticsearch" | "mongodb" | "hive" | "spark" | "neo4j";
+export type DbFamily = "relational" | "kv" | "search" | "document" | "bigdata" | "graph";
 
 export interface ConnConfig {
   id: string; name: string; type: DbTypeId;
   description?: string; host?: string; port?: number;
   username?: string; password?: string;
   /** 家族语义：关系型=库名 / DM=schema / Redis=不用（用 dbIndex）/
-      ES=默认 index / Hive-Spark=database 名 */
+      ES=默认 index / Hive-Spark=database 名 / Neo4j=图数据库名（缺省 neo4j） */
   database?: string;
   dbIndex?: number;                 // Redis 库号
   apiKey?: string;                  // ES 预留（二期）

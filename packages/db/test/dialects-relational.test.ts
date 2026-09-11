@@ -43,7 +43,7 @@ describe("relational dialects registered", () => {
     const shown = d.displayUrl({ id: "x", name: "n", type: "postgresql", host: "h", port: 5432, username: "u", password: "secret", database: "db", createdAt: "" });
     assert.ok(!shown.includes("secret"));
   });
-  it("registry size is exactly 9 after mongodb dialect (Spec §9 规模断言)", () => {
-    assert.equal(registry.size, 9);
+  it("registry size is exactly 10 after neo4j dialect (Spec §9 规模断言)", () => {
+    assert.equal(registry.size, 10);
   });
 });

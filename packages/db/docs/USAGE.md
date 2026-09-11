@@ -17,6 +17,7 @@
    jdbc:dm://host:5236/schema              → 达梦
    redis://:pass@host:6379/0               → Redis（含 rediss:// TLS）
    mongodb://user:pass@host:27017/db       → MongoDB（含 +srv Atlas 形态）
+   bolt://user:pass@host:7687/db           → Neo4j（也认 neo4j://、bolt+s(ssc)://、neo4j+s(ssc)://）
    http://host:9200                        → Elasticsearch
    jdbc:hive2://host:10000/db              → Hive / Spark
    ```
@@ -101,6 +102,27 @@ HGETALL myhash
 - **list_tables** → `listCollections`；**describe_table** → `collStats` + 索引 + `$jsonSchema` validator（缺失时采样 ≤100 文档推断字段，非权威 schema）
 - **硬限制**：`drop*`/`create*` 等管理 DDL、服务端 JS（`$where`/`$function`/`$accumulator`）恒拒；aggregate 含 `$out`/`$merge` 按写分类；未知命令保守按写
 - 连接串：`mongodb://` 与 `mongodb+srv://`（SRV 默认 TLS）；`authSource` 缺省 `admin`，`replicaSet`/`authMechanism` 等经 options 贯通
+
+### Neo4j（图）
+
+`sql` 填 Cypher 原文，支持分号分隔多语句（逐条执行，返回最后一条结果）：
+
+```cypher
+MATCH (n:Person) RETURN n LIMIT 10
+MATCH (n:Person)-[r:KNOWS]->(m) WHERE n.age > 18 RETURN n, r, m
+CALL db.labels() YIELD label RETURN label
+SHOW INDEXES
+```
+
+实现要点：
+
+- **图结构即表**：`list_tables` 返回 node label（NODE LABEL）与关系类型（RELATIONSHIP，`rel:` 前缀）；`describe_table` 目标填 label 名或 `rel:类型`
+- **describe_table**：实体计数 + `SHOW INDEXES/CONSTRAINTS`（过滤目标）+ 采样 ≤100 推断属性键与类型分布（非权威 schema）；唯一约束属性标主键；只依赖核心过程，**不依赖 APOC**
+- **读写管控**：CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP/FOREACH/LOAD CSV 任意深度出现即按写（`MATCH (n) DETACH DELETE n` 这类读外壳夹写拦得住）；字符串字面量与注释内的写词不误判；`CALL dbms.*` 管理过程**恒拒**；未知 CALL 过程（含 apoc.*）保守按写
+- **结果拍平**：Node 渲染为 `:Label {属性}`，Relationship 为 `-(TYPE)-> {属性}`，Path 为 `<path:n>`；无返回记录的写语句回显变更计数（创建节点 n，设置属性 m）
+- **limit 封顶**：客户端截断对齐关系型方言（不做 Cypher LIMIT 注入，任意语句尾部加 LIMIT 不总合法）
+- **连接串**：`bolt://`/`neo4j://`/`bolt+s://`/`neo4j+s://` 等；建连统一走 Bolt 直连（`bolt://`/`bolt+s://`）——单机社区版无路由服务，`neo4j://` 路由 scheme 会报 No routing servers available；URL 路径段 = 图数据库名（缺省 `neo4j`）
+- **扫描建连**：Spring `spring.neo4j.uri`（Boot 3）/ `spring.data.neo4j.uri`（Boot 2）+ authentication 账号密码键、`.env` `NEO4J_URI`/`NEO4J_URL`/`BOLT_URL`、docker-compose `neo4j` 镜像（`NEO4J_AUTH`/`NEO4J_PASSWORD`）、通用 URL 正则
 
 ## ✍️ 写操作：理由与审计
 

@@ -9,11 +9,11 @@
 
 </div>
 
-为 [pi](https://github.com/earendilofficial/pi) 提供 9 种数据库的查询、表结构浏览、扫描建连与安全管控：AI 通过 5 个工具读写数据库，用户通过 `/db` 菜单管理连接。
+为 [pi](https://github.com/earendilofficial/pi) 提供 10 种数据库的查询、表结构浏览、扫描建连与安全管控：AI 通过 5 个工具读写数据库，用户通过 `/db` 菜单管理连接。
 
 ## ✨ 特性
 
-- **9 种数据库 · 5 家族**：PostgreSQL · MySQL · Oracle · 达梦 · Redis · Elasticsearch · MongoDB · Hive · Spark
+- **10 种数据库 · 6 家族**：PostgreSQL · MySQL · Oracle · 达梦 · Redis · Elasticsearch · MongoDB · Neo4j · Hive · Spark
 - **AI 工具**：查询 / 表结构 / 连接清单 / 扫描建连，读多写少场景的 token 友好输出
 - **扫描建连**：从 Spring / docker-compose / .env 自动抽取连接候选，终端确认后写入
 - **安全模型**：只读模式、写确认 + 执行理由、连接级强制只读、家族白名单、管理命令恒拒
@@ -29,7 +29,7 @@ pi install ./packages/db     # 本仓库开发者
 
 ## 🚀 快速开始
 
-1. `/db add` 粘贴连接串一键建连（支持 `postgresql://` · `jdbc:*` · `redis://` · `mongodb+srv://` · `http://host:9200`）
+1. `/db add` 粘贴连接串一键建连（支持 `postgresql://` · `jdbc:*` · `redis://` · `mongodb+srv://` · `bolt://`/`neo4j://` · `http://host:9200`）
 2. 直接让 AI 查询：*「查一下订单表最近 10 条」*
 3. `/db scan` 从项目源码自动发现数据库连接（密码只在终端补录，不进模型上下文）
 
@@ -44,6 +44,7 @@ pi install ./packages/db     # 本仓库开发者
 | Redis | KV | 2.8 ~ 8.x |
 | Elasticsearch | 搜索 | 7.x / 8.x+（自动探测大版本） |
 | MongoDB | 文档 | 已验证 6.0 / 7.0 / 8.0；4.2+ 可用 |
+| Neo4j | 图 | 官方兼容矩阵 4.4 ~ 2025.x；已验证 4.4.29 community |
 | Hive | 大数据 | 2.x / 3.x；4.x 未实测 |
 | Spark（Thrift Server） | 大数据 | 2.x ~ 4.x |
 
@@ -58,6 +59,7 @@ pi install ./packages/db     # 本仓库开发者
 | KV · Redis | 空格分隔命令 | `GET key` / `SCAN 0 MATCH user:*` |
 | 搜索 · ES | JSON DSL | `{"query": {"match_all": {}}}` |
 | 文档 · MongoDB | JSON 命令信封 | `{"find": "users", "filter": {}}` |
+| 图 · Neo4j | Cypher | `MATCH (n:Person) RETURN n LIMIT 10` |
 
 关系型直接填 SQL。各家族示例与实现要点 → [docs/USAGE.md](./docs/USAGE.md)。
 
@@ -69,7 +71,7 @@ pi install ./packages/db     # 本仓库开发者
 | 写确认 | 写操作弹框展示：理由 + 命令摘要 + SQL |
 | 写执行理由 | AI 必须附 `reason`（动机+影响范围），缺失直接拒绝 |
 | 连接级强制只读 | 标记的连接（如生产库）无视全局开关，永远只读 |
-| 家族白名单 | Redis/ES/Mongo 只读白名单；`DROP`、管理 DDL、服务端 JS 恒拒 |
+| 家族白名单 | Redis/ES/Mongo 只读白名单；`DROP`、管理 DDL、服务端 JS、`CALL dbms.*` 恒拒 |
 | 审计日志 | 默认关；`/db config` 开启后写操作按天落盘（完整 SQL，0600） |
 | 凭据 | 配置文件 `0600`；扫描场景密码掩码，不进模型上下文 |
 

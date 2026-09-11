@@ -1,7 +1,7 @@
 {
   "name": "@nsyan/db",
-  "version": "1.1.1",
-  "description": "AI 接入数据库扩展 —— 五大家族方言架构，支持 PostgreSQL/MySQL/Oracle/达梦/Redis/Elasticsearch/MongoDB/Hive/Spark 九种数据库，提供查询/表结构/扫描建连/连接清单工具给 LLM",
+  "version": "1.2.0",
+  "description": "AI 接入数据库扩展 —— 六大家族方言架构，支持 PostgreSQL/MySQL/Oracle/达梦/Redis/Elasticsearch/MongoDB/Neo4j/Hive/Spark 十种数据库，提供查询/表结构/扫描建连/连接清单工具给 LLM",
   "keywords": [
     "pi-extension",
     "pi-package",
@@ -15,6 +15,9 @@
     "elasticsearch",
     "mongodb",
     "mongo",
+    "neo4j",
+    "graph",
+    "cypher",
     "hive",
     "spark"
   ],
@@ -48,7 +51,9 @@
     "ioredis": "^6.0.0",
     "mongodb": "^6.21.0",
     "mysql2": "^3.23.1",
+    "neo4j-driver": "^5.28.3",
     "oracledb": "^7.0.1",
+    "neo4j-driver": "^5.28.3",
     "pg": "^8.22.0"
   },
   "devDependencies": {

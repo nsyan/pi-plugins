@@ -58,6 +58,8 @@ function familyHint(c: ConnConfig): string {
       return "关系型，sql 参数填 SQL";
     case "mongodb":
       return "MongoDB 文档库，sql 参数填 JSON 命令信封（如 {\"find\":\"users\",\"filter\":{}}；读命令 find/count/distinct/aggregate）";
+    case "neo4j":
+      return "Neo4j 图数据库，sql 参数填 Cypher（如 MATCH (n:Person) RETURN n LIMIT 10；list_tables 列出 label 与关系类型，describe_table 目标填 label 名或 rel:类型）";
     default:
       return `${fullTypeLabel(c.type)}，sql 参数填查询或命令`;
   }
@@ -264,11 +266,11 @@ export default function (pi: ExtensionAPI) {
     let dbIndex: number | undefined;
 
     if (mode === "⚡ 粘贴连接串（一键）") {
-      const url = (await ctx.ui.input("连接串", "postgresql://user:pass@host:5432/db 或 jdbc:mysql://... 或 redis://:pass@host:6379/0 或 mongodb://user:pass@host:27017/db"))?.trim();
+      const url = (await ctx.ui.input("连接串", "postgresql://user:pass@host:5432/db 或 jdbc:mysql://... 或 redis://:pass@host:6379/0 或 mongodb://user:pass@host:27017/db 或 neo4j://user:pass@host:7687"))?.trim();
       if (!url) { ctx.ui.notify("连接串不能为空", "error"); return; }
       const pcs = parseConnectionString(url);
       if (!pcs) {
-        ctx.ui.notify("连接串无法识别。支持: postgresql/mysql/oracle/dm/hive JDBC、redis(s)://、mongodb(srv)://、http(s)://host:9200", "error");
+        ctx.ui.notify("连接串无法识别。支持: postgresql/mysql/oracle/dm/hive JDBC、redis(s)://、mongodb(srv)://、neo4j/bolt(s)://、http(s)://host:9200", "error");
         return;
       }
       parsed = { dialectId: pcs.dialectId, host: pcs.host, port: pcs.port, database: pcs.database, options: pcs.options };
@@ -285,6 +287,7 @@ export default function (pi: ExtensionAPI) {
           "  Oracle:     jdbc:oracle:thin:@//host:port/service 或 @host:port:SID\n" +
           "  Redis:      redis://[:password@]host:port[/db]\n" +
           "  MongoDB:    mongodb://user:pass@host:27017/db 或 mongodb+srv://...\n" +
+          "  Neo4j:      neo4j://user:pass@host:7687/db 或 bolt://host:7687（路径段为图数据库名）\n" +
           "  ES:         http://host:9200", "error");
         return;
       }
@@ -299,6 +302,11 @@ export default function (pi: ExtensionAPI) {
       } else if (parsed.dialectId === "mongodb") {
         username = (await ctx.ui.input("账号（可空，本地无认证留空）", ""))?.trim() ?? "";
         password = (await ctx.ui.input("密码（可空）", ""))?.trim() ?? "";
+      } else if (parsed.dialectId === "neo4j") {
+        username = (await ctx.ui.input("账号", "neo4j"))?.trim() || "neo4j";
+        password = (await ctx.ui.input("密码", ""))?.trim() ?? "";
+        const dbInput = (await ctx.ui.input("图数据库名（缺省 neo4j）", parsed.database ?? "neo4j"))?.trim();
+        parsed.database = dbInput || parsed.database || "neo4j";
       } else {
         username = (await ctx.ui.input("账号", "root"))?.trim() || "root";
         password = (await ctx.ui.input("密码", ""))?.trim() ?? "";
@@ -742,11 +750,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "query_database",
     label: "数据库查询",
-    description: "执行 SQL 语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / MongoDB / Hive / Spark 九种数据库，返回执行结果。支持读和写，写操作受确认策略约束且必须附 reason 执行理由（动机+影响范围），用户确认框将展示该理由；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。MongoDB 的 sql 参数填 JSON 命令信封（db.runCommand 形态，如 {\"find\":\"users\",\"filter\":{}}）。",
+    description: "执行语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / MongoDB / Neo4j / Hive / Spark 十种数据库，返回执行结果。支持读和写，写操作受确认策略约束且必须附 reason 执行理由（动机+影响范围），用户确认框将展示该理由；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。MongoDB 的 sql 参数填 JSON 命令信封（db.runCommand 形态，如 {\"find\":\"users\",\"filter\":{}}）；Neo4j 填 Cypher（如 MATCH (n:Person) RETURN n LIMIT 10）。",
     promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；写操作必须在 reason 参数说明动机与影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"），否则会被拒绝。database 参数取系统提示「可用数据库」列表中的名称（缺省走默认连接）。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
       database: Type.Optional(Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称；缺省走默认连接）" })),
-      sql: Type.String({ description: "SQL 语句；MongoDB 填 JSON 命令信封，Redis 填命令，ES 填 DSL" }),
+      sql: Type.String({ description: "语句；关系型填 SQL，MongoDB 填 JSON 命令信封，Redis 填命令，ES 填 DSL，Neo4j 填 Cypher" }),,
       reason: Type.Optional(Type.String({ description: "执行理由，写操作必填：动机+影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"）。读操作无需填写" })),
     }),
     async execute(_toolCallId: string, params: { database?: string; sql: string; reason?: string }, _signal: any, _onUpdate?: any, ctx?: any) {
