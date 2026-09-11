@@ -1,16 +1,19 @@
 {
   "name": "@nsyan/db",
-  "version": "1.2.0",
-  "description": "AI 接入数据库扩展 —— 六大家族方言架构，支持 PostgreSQL/MySQL/Oracle/达梦/Redis/Elasticsearch/MongoDB/Neo4j/Hive/Spark 十种数据库，提供查询/表结构/扫描建连/连接清单工具给 LLM",
+  "version": "1.2.1",
+  "description": "AI 数据库接入扩展 for pi —— 达梦(DM)/PostgreSQL/MySQL/Oracle/Redis/Elasticsearch/MongoDB/Neo4j/Hive/Spark 十种数据库，六大家族方言，提供查询/表结构/扫描建连/连接清单 LLM 工具 | Database access extension for the pi coding agent: query, schema browsing, connection scanning and audit tools for PostgreSQL, MySQL, Oracle, DM (Dameng 达梦), Redis, Elasticsearch, MongoDB, Neo4j, Hive and Spark",
   "keywords": [
     "pi-extension",
     "pi-package",
     "database",
+    "sql",
+    "llm",
     "postgresql",
     "mysql",
     "oracle",
     "dameng",
     "dm",
+    "达梦",
     "redis",
     "elasticsearch",
     "mongodb",
@@ -21,6 +24,10 @@
     "hive",
     "spark"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nsyan/pi-plugins.git"
+  },
   "license": "MIT",
   "main": "index.ts",
   "pi": {

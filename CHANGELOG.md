@@ -2,6 +2,15 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.1] - 2026-09-12
+
+### Changed（packages/db）
+
+- 发布元数据: description 改中英双语，补 database access/query/schema browsing/scan 等英文检索词
+- 发布元数据: keywords 新增 达梦/sql/llm（覆盖中文检索与高频词）
+- 发布元数据: package.json 补 repository 字段指向 GitHub 仓库，pi.dev gallery 详情页可展示 repo 链接
+- 发布配置: 版本号 1.2.1，重发触发 pi.dev 目录重索引（issue #6991 实测重发后约 2.5h 收录）
+
 ## [1.2.0] - 2026-09-12
 
 ### Added（packages/db）
