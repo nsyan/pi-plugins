@@ -61,7 +61,9 @@ class HiveDialect extends BigDataDialect {
   }
 
   protected async doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection> {
-    const client = new hive.HiveClient(TCLIService, TCLIService_types);
+    // 上游 hive-driver 的 TCLIServiceTypes 声明不完整（缺 25 个请求类型），与其运行时实际
+    // 使用的 thrift 定义不一致；仅放宽类型断言，运行时对象未做任何改动。
+    const client = new hive.HiveClient(TCLIService, TCLIService_types as any);
     await client.connect(
       { host: config.host ?? "localhost", port: config.port ?? DEFAULT_PORT },
       new hive.connections.TcpConnection(),

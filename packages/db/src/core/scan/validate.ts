@@ -6,7 +6,7 @@
 
 import { basename } from "node:path";
 import { registry } from "../../dialects/index.js";
-import type { Candidate, CandidateInput, CandidateStatus, DbTypeId } from "../types.js";
+import type { Candidate, CandidateInput, CandidateStatus, ConnConfig, DbTypeId } from "../types.js";
 
 /** 各类型建连必需字段（空串同样视为缺失）——家族语义，非正则，保留 */
 const REQUIRED: Record<DbTypeId, string[]> = {
@@ -54,7 +54,9 @@ export function validateCandidates(raw: unknown, existingNames: Set<string>): Va
 
     // ② 带 url 时：方言 parseUrl 必须能解析（防幻觉——claim 与 url 矛盾整条拒）
     //    解析成功时以解析结果为准（host/port/database/username/password 由 URL 补全）
-    let bag: Partial<CandidateInput> = {
+    // 归一化后 port/dbIndex 恒为 number（下行 parseInt 收敛）。此处用 Partial<ConnConfig> 而非
+    // Partial<CandidateInput>——后者的 port 是 number|string，会让下方端口范围校验退化为字符串比较。
+    let bag: Partial<ConnConfig> = {
       host: typeof c.host === "string" ? c.host.trim() : undefined,
       port: typeof c.port === "number" ? c.port : parseInt(String(c.port ?? ""), 10) || undefined,
       username: nonEmpty(c.username) ? String(c.username) : undefined,
@@ -90,7 +92,7 @@ export function validateCandidates(raw: unknown, existingNames: Set<string>): Va
     }
 
     // ④ 缺字段判定
-    const missing = (REQUIRED[dialect.id] ?? []).filter((f) => !nonEmpty(bag[f as keyof CandidateInput]));
+    const missing = (REQUIRED[dialect.id] ?? []).filter((f) => !nonEmpty(bag[f as keyof ConnConfig]));
 
     // ⑤ 命名：显式 name > 默认；同名（含与本批前序候选撞名）→ exists 状态
     let name = nonEmpty(c.name) ? String(c.name).trim()

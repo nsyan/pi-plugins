@@ -80,10 +80,12 @@ class DmDialect extends RelationalDialect {
   protected async doExecute(client: unknown, stmt: string, opts: ExecOpts): Promise<{ columns: string[]; rows: unknown[][]; rowCount: number }> {
     const dmConn = client as dmdb.Connection;
     const maxRows = opts.maxRows;
+    // 上游 dmdb 的 ExecuteOptions 未声明 maxRows/fetchArraySize（运行时可接受或被忽略）；
+    // 结果另有下方 .slice(0, maxRows) 兜底，故此处仅放宽类型断言，不改运行时行为。
     const res = await dmConn.execute(stmt, [], {
       maxRows,
       fetchArraySize: maxRows,
-    });
+    } as dmdb.ExecuteOptions);
     if (res.metaData && res.metaData.length > 0) {
       const columns = res.metaData.map((m: any) => m.name);
       const rows = (res.rows ?? []).slice(0, maxRows).map((r: any) => [...r]);
@@ -95,7 +97,8 @@ class DmDialect extends RelationalDialect {
   async versionQuery(conn: DbConnection): Promise<string> {
     const dmConn = conn.client as dmdb.Connection;
     const res = await dmConn.execute("SELECT * FROM V$VERSION");
-    return (res.rows ?? [])[0]?.[0] as string ?? "unknown";
+    const rows = (res.rows as unknown[][] | undefined) ?? [];
+    return (rows[0]?.[0] as string | undefined) ?? "unknown";
   }
 
   async listTables(config: ConnConfig, pattern?: string): Promise<ListTablesResult> {

@@ -50,13 +50,21 @@ function buildDisplayList(configs: ConnConfig[]): { list: string[]; map: Map<str
 // ── 构建「可用数据库」提示（注入系统提示，让 AI 知道有哪些连接） ────
 // 效率项（Spec §6）：每连接只注一行 `名称[家族] + 一行语义`，细节压进系统提示
 
-// 各家族一行语义（KV/搜索/大数据行由后续任务的 dialect.label 接管，此处三库先行）
+// 各家族一行语义：让 AI 一眼知道该类型的 sql 参数填什么（覆盖全部十种类型）
 function familyHint(c: ConnConfig): string {
   switch (c.type) {
     case "postgresql":
     case "mysql":
     case "oracle":
+    case "dm":
       return "关系型，sql 参数填 SQL";
+    case "redis":
+      return "Redis 键值库，sql 参数填单条 Redis 命令（如 GET key / SCAN 0 MATCH user:* COUNT 100；KEYS 已禁用，扫描请用 SCAN）";
+    case "elasticsearch":
+      return "Elasticsearch 搜索库，sql 参数填 DSL JSON（如 {\"query\":{\"match_all\":{}}}；仅支持读端点 _search/_count/_mget）";
+    case "hive":
+    case "spark":
+      return "大数据 SQL 引擎，sql 参数填 SQL（如 SELECT * FROM 库.表 LIMIT 10）";
     case "mongodb":
       return "MongoDB 文档库，sql 参数填 JSON 命令信封（如 {\"find\":\"users\",\"filter\":{}}；读命令 find/count/distinct/aggregate）";
     case "neo4j":
@@ -655,7 +663,7 @@ export default function (pi: ExtensionAPI) {
         const val = await ctx.ui.select(`选择 ${field.label}`, field.options);
         if (!val) continue;
         if (field.valueMap) {
-          (newCfg as any)[field.key] = field.valueMap[val];
+          (newCfg as any)[field.key] = (field.valueMap as Record<string, unknown>)[val];
         } else {
           (newCfg as any)[field.key] = val === "是";
         }
@@ -699,7 +707,11 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  // ── 注册 3 个工具（给 LLM 调用） ──────────────────
+  // ── 注册 6 个工具（给 LLM 调用） ──────────────────
+  // 注：pi 的 AgentToolResult.details 为必填字段（registerTool 的 TDetails 默认 unknown）。
+  // 本插件工具没有结构化详情，故在返回对象里统一显式写 details: undefined——与"完全不提供该字段"
+  // 在运行时等价：宿主读取走可选链（result.details?.x）、合并判定用 `!== undefined`，
+  // 且 JSON 序列化会跳过 undefined 值。
 
   // 解析工具 database 参数：缺省走默认连接（Spec §11.1）；无默认则报错指引
   function resolveTargetDb(name: string | undefined): { config?: ConnConfig; error?: string } {
@@ -735,7 +747,7 @@ export default function (pi: ExtensionAPI) {
 
       const target = resolveTargetDb(params.database);
       if (target.error || !target.config) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: target.error ?? "未找到数据库配置" }],
         };
       }
@@ -748,7 +760,7 @@ export default function (pi: ExtensionAPI) {
       // verdict = dialect.isAllowed(sql, readonly) → decide → deny/confirm/run
       const dialect = registry.get(config.type);
       if (!dialect) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `数据库类型 "${config.type}" 暂不支持。` }],
         };
       }
@@ -758,19 +770,19 @@ export default function (pi: ExtensionAPI) {
         const note = !cfg.ai_readonly && config.forceReadonly === true
           ? `（连接 ${config.name} 已设置强制只读）`
           : "";
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: (verdict.reason ?? "该操作不被允许。如需修改，请执行 /db config 更改配置。") + note }],
         };
       }
       // 写操作强制附执行理由（v1.1 UX 共识 Q1/Q3：与确认策略解耦；缺 reason 拒绝并引导 AI 补充）
       if (writeRequiresReason(verdict, params.reason)) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: "写操作必须附执行理由：请在 reason 参数中说明动机与影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"），补充后重试。" }],
         };
       }
       if (action === "confirm") {
         if (!ctx?.hasUI) {
-          return {
+          return { details: undefined,
             content: [{ type: "text" as const, text: "当前环境无法弹出确认对话框，已取消 SQL 执行。请在有界面的环境中操作。" }],
           };
         }
@@ -779,7 +791,7 @@ export default function (pi: ExtensionAPI) {
           `理由: ${params.reason}\n\n${verdict.summary ?? ""}\n\n数据库: ${config.name}\n\nSQL:\n${params.sql}`,
         );
         if (!ok) {
-          return {
+          return { details: undefined,
             content: [{ type: "text" as const, text: "用户取消了 SQL 执行。" }],
           };
         }
@@ -793,7 +805,7 @@ export default function (pi: ExtensionAPI) {
       );
 
       if (!result.success) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `查询失败: ${result.error}` }],
         };
       }
@@ -841,7 +853,7 @@ export default function (pi: ExtensionAPI) {
         text += `\n执行理由: ${params.reason}`;
       }
 
-      return { content: [{ type: "text" as const, text }] };
+      return { details: undefined, content: [{ type: "text" as const, text }] };
     },
   });
 
@@ -858,7 +870,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId: string, params: { database?: string; pattern?: string }, _signal: any) {
       const target = resolveTargetDb(params.database);
       if (target.error || !target.config) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: target.error ?? "未找到数据库配置" }],
         };
       }
@@ -866,14 +878,14 @@ export default function (pi: ExtensionAPI) {
 
       const dialect = registry.get(config.type);
       if (!dialect) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `数据库类型 "${config.type}" 暂不支持。` }],
         };
       }
       const result = await dialect.listTables(toRuntimeConfig(config, dialect.defaultPort), params.pattern);
 
       if (!result.success || !result.tables) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `获取表列表失败: ${result.error}` }],
         };
       }
@@ -885,7 +897,7 @@ export default function (pi: ExtensionAPI) {
         return `${schema}${t.name} (${t.type})${desc}`;
       });
 
-      return {
+      return { details: undefined,
         content: [{ type: "text" as const, text: `数据库 "${config.name}"${params.pattern ? `（pattern: ${params.pattern}）` : ""} 共 ${result.count} 张表:\n${lines.join("\n")}` }],
       };
     },
@@ -904,7 +916,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId: string, params: { database?: string; table: string }, _signal: any) {
       const target = resolveTargetDb(params.database);
       if (target.error || !target.config) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: target.error ?? "未找到数据库配置" }],
         };
       }
@@ -912,14 +924,14 @@ export default function (pi: ExtensionAPI) {
 
       const dialect = registry.get(config.type);
       if (!dialect) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `数据库类型 "${config.type}" 暂不支持。` }],
         };
       }
       const result = await dialect.describeTable(toRuntimeConfig(config, dialect.defaultPort), params.table);
 
       if (!result.success || !result.columns) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `获取表结构失败: ${result.error}` }],
         };
       }
@@ -935,7 +947,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      return {
+      return { details: undefined,
         content: [{ type: "text" as const, text: lines.join("\n") }],
       };
     },
@@ -966,9 +978,9 @@ export default function (pi: ExtensionAPI) {
           "4. 调用 db_scan_save 提交候选数组。带 url 的候选必须能被对应方言解析，编造的 url 会被拒绝；",
           "5. 工具会弹确认框让用户逐个确认并补录密码，把工具返回的保存结果汇报给用户。",
         ].join("\n");
-        return { content: [{ type: "text" as const, text }] };
+        return { details: undefined, content: [{ type: "text" as const, text }] };
       } catch (err) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: `扫描失败: ${err instanceof Error ? err.message : String(err)}` }],
         };
       }
@@ -996,7 +1008,7 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId: string, params: { candidates: unknown[] }, _signal: any, _onUpdate?: any, ctx?: any) {
       if (!ctx?.ui) {
-        return { content: [{ type: "text" as const, text: "db_scan_save 需要交互式会话（ctx.ui 不可用）。请引导用户在终端执行 /db add 手动添加。" }] };
+        return { details: undefined, content: [{ type: "text" as const, text: "db_scan_save 需要交互式会话（ctx.ui 不可用）。请引导用户在终端执行 /db add 手动添加。" }] };
       }
       const { candidates, rejected } = validateCandidates(params.candidates, new Set(loadConfigs().map((c) => c.name)));
       const lines: string[] = [];
@@ -1006,7 +1018,7 @@ export default function (pi: ExtensionAPI) {
       if (candidates.length === 0) {
         lines.push(rejected.length > 0 ? "没有可保存的候选。" : "未收到有效候选（candidates 需为数组，每项含 dialectId+host）。",
           "提示：从配置文件原文提取后重试；确认方言取值在支持列表内。");
-        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+        return { details: undefined, content: [{ type: "text" as const, text: lines.join("\n") }] };
       }
       lines.push(`收到 ${candidates.length} 个连接候选，逐个确认：`, ...candidates.map(candidateLine), "");
       const results: string[] = [];
@@ -1019,7 +1031,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       lines.push("", "保存结果：", ...results.map((r) => "  - " + r));
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      return { details: undefined, content: [{ type: "text" as const, text: lines.join("\n") }] };
     },
   });
 
@@ -1033,7 +1045,7 @@ export default function (pi: ExtensionAPI) {
     async execute() {
       const configs = loadConfigs();
       if (configs.length === 0) {
-        return {
+        return { details: undefined,
           content: [{ type: "text" as const, text: "尚无数据库连接。请引导用户在终端执行 /db add 或 /db scan 建连。" }],
         };
       }
@@ -1046,7 +1058,7 @@ export default function (pi: ExtensionAPI) {
         const url = registry.get(c.type)?.displayUrl(c) ?? "";
         return `- ${c.name} [${shortTypeLabel(c.type)}]${marks ? " " + marks : ""} - ${fullTypeLabel(c.type)}${c.database ? " · 库: " + c.database : ""} · ${url} · ${test}${used ? " · " + used : ""}${c.description ? " · " + c.description : ""}`;
       });
-      return {
+      return { details: undefined,
         content: [{ type: "text" as const, text: `共 ${configs.length} 个连接：\n${lines.join("\n")}\n\n标注 [prod·强制只读] 的连接永远只读（即使全局允许写操作）。` }],
       };
     },

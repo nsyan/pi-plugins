@@ -109,9 +109,11 @@ class MysqlDialect extends RelationalDialect {
     try {
       const tables = await this.withConnection(config, async (conn) => {
         const mysqlConn = conn.client as mysql.Connection;
+        // config.database 为可选（ConnConfig），而 mysql2 的 ExecuteValues 不接受 undefined 元素；
+        // 此处仅放宽类型断言，运行时参数与既有行为完全一致。
         const [rows] = await mysqlConn.execute(
           "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
-          [config.database],
+          [config.database] as any[],
         );
         const all = (rows as any[]).map((r: any) => ({
           schema: "",
@@ -149,7 +151,7 @@ class MysqlDialect extends RelationalDialect {
         try {
           const [commentRows] = await mysqlConn.execute(
             "SELECT COLUMN_NAME, COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-            [config.database, table],
+            [config.database, table] as any[],
           );
           const commentMap = new Map((commentRows as any[]).map((r: any) => [r.COLUMN_NAME, r.COLUMN_COMMENT]));
           for (const col of cols) {

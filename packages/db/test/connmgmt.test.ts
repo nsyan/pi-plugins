@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { effectiveReadonly, writeRequiresReason } from "../src/core/policy.js";
 import { connSummaryLine, envTagLabel, formatRelativeTime, DEFAULT_PLUGIN_CONFIG } from "../src/config.js";
 import { appendAuditLog, auditFilePath, localDateStr, type AuditEntry } from "../src/core/audit.js";
-import type { ConnConfig, Verdict } from "../src/core/types.js";
+import type { ConnConfig } from "../src/core/types.js";
+import type { Verdict } from "../src/dialects/dialect.js";
 
 const base: ConnConfig = {
   id: "x", name: "jail-pg", type: "postgresql", createdAt: "2026-01-01T00:00:00Z",

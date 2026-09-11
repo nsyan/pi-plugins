@@ -163,7 +163,9 @@ class ElasticsearchDialect extends SearchDialect {
         return { columns: ["count"], rows: [[count]], rowCount: count };
       }
       if (kind.endpoint === "_mget") {
-        const res = await es.mget({ index, body: { docs: [] } });
+        // 注：_mget 需兼容 v7 客户端的 body 形态（本文件为 v7/v8/v9 三客户端分发），
+        // 而 v8/v9 的类型已把请求体改为顶层 docs，故按运行时通用形态传参并放宽参数类型。
+        const res = await es.mget({ index, body: { docs: [] } } as unknown as Parameters<ClientV8["mget"]>[0]);
         return docsToRows(unwrap(res));
       }
       // _search：DSL 整体即 body

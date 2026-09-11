@@ -7,8 +7,9 @@ class Stub extends RelationalDialect {
   id = "postgresql" as const; label = "PostgreSQL"; family = "relational" as const; defaultPort = 5432;
   fingerprints = { urlPatterns: [/^jdbc:postgresql:\/\//], configKeys: [] as string[] };
   parseUrl = () => null; displayUrl = () => "";
-  protected async doConnect() { throw new Error("no conn in unit test"); }
-  protected async doExecute() { throw new Error("no conn in unit test"); }
+  // 返回类型标注 Promise<never>：方法只抛错，never 是基类返回类型的子类型，避免被推断成 Promise<void>。
+  protected async doConnect(): Promise<never> { throw new Error("no conn in unit test"); }
+  protected async doExecute(): Promise<never> { throw new Error("no conn in unit test"); }
   async versionQuery() { return ""; }
   async listTables() { return { success: false as const, error: "nope" }; }
   async describeTable() { return { success: false as const, error: "nope" }; }

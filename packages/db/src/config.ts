@@ -274,11 +274,26 @@ export function toRuntimeConfig(c: ConnConfig, defaultPort: number): ConnConfig 
   };
 }
 
-// 供 UI 层展示类型短标签（原 index.ts 内 5 处重复映射的收敛点之一）
+// 供 UI 层展示类型标签（原 index.ts 内 5 处重复映射的收敛点之一）
+// 单一数据源：短标签与全称同表维护。键类型用 Record<DbTypeId, ...> 而非 Record<string, ...>，
+// 新增方言而漏补标签时会在类型检查阶段报错，不再静默 fallback 成原始 id。
+const TYPE_LABELS: Record<DbTypeId, { short: string; full: string }> = {
+  postgresql: { short: "PG", full: "PostgreSQL" },
+  mysql: { short: "MySQL", full: "MySQL" },
+  oracle: { short: "Oracle", full: "Oracle" },
+  dm: { short: "DM", full: "达梦" },
+  redis: { short: "Redis", full: "Redis" },
+  elasticsearch: { short: "ES", full: "Elasticsearch" },
+  mongodb: { short: "MongoDB", full: "MongoDB" },
+  neo4j: { short: "Neo4j", full: "Neo4j" },
+  hive: { short: "Hive", full: "Hive" },
+  spark: { short: "Spark", full: "Spark" },
+};
+
 export function shortTypeLabel(type: DbTypeId): string {
-  return ({ postgresql: "PG", mysql: "MySQL", oracle: "Oracle", mongodb: "MongoDB", neo4j: "Neo4j" } as Record<string, string>)[type] ?? type;
+  return TYPE_LABELS[type]?.short ?? type;
 }
 
 export function fullTypeLabel(type: DbTypeId): string {
-  return ({ postgresql: "PostgreSQL", mysql: "MySQL", oracle: "Oracle", mongodb: "MongoDB", neo4j: "Neo4j" } as Record<string, string>)[type] ?? type;
+  return TYPE_LABELS[type]?.full ?? type;
 }

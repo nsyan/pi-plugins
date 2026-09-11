@@ -93,9 +93,13 @@ class RedisDialect extends KvDialect {
         let sampled = 0;
         let cursor = "0";
         // LIKE（%/_）→ SCAN 通配（*/?），全局替换（String.replace 单次替换是 bug）
-        const matchArgs = pattern ? ["MATCH", pattern.split("").map((ch) => ch === "%" ? "*" : ch === "_" ? "?" : ch).join("")] : [];
+        const scanPattern = pattern ? pattern.split("").map((ch) => ch === "%" ? "*" : ch === "_" ? "?" : ch).join("") : null;
         do {
-          const [next, keys] = await redis.scan(cursor, "COUNT", 100, ...matchArgs);
+          // ioredis 的 scan 重载要求 MATCH/COUNT 固定次序，不能靠 spread 拼参；
+          // Redis 的 SCAN 命令本身不区分参数顺序，故两个分支与原来的命令语义完全一致。
+          const [next, keys] = scanPattern
+            ? await redis.scan(cursor, "MATCH", scanPattern, "COUNT", 100)
+            : await redis.scan(cursor, "COUNT", 100);
           cursor = next;
           for (const key of keys) {
             if (sampled >= 200) break;
@@ -166,7 +170,8 @@ class RedisDialect extends KvDialect {
           } else if (type === "set") {
             preview = JSON.stringify(await redis.smembers(key)).slice(0, 200);
           } else if (type === "zset") {
-            preview = JSON.stringify(await redis.zrange(key, 0, 9, "WITHSCORES")).slice(0, 200);
+            // ioredis 6 的 zrange 重载把 stop 声明为 string|Buffer（漏了 number）；索引 "9" 与数字 9 等价。
+            preview = JSON.stringify(await redis.zrange(key, 0, "9", "WITHSCORES")).slice(0, 200);
           }
         } catch { /* ignore */ }
         return [

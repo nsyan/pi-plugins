@@ -270,7 +270,7 @@ class Neo4jDialect extends GraphDialect {
             const f = r._fields ?? [];
             const types = f[3] as string[] | null;
             if (!Array.isArray(types) || !types.includes(graphName)) continue;
-            indexLines.push(`${f[0]}(${f[1]}, ${f[5] ?? "online"}) ON ${isRel ? "rel" : "node"}(${types.join(":")}).(${(f[4] ?? []).join(",")})`);
+            indexLines.push(`${f[0]}(${f[1]}, ${f[5] ?? "online"}) ON ${isRel ? "rel" : "node"}(${types.join(":")}).(${((f[4] ?? []) as string[]).join(",")})`);
           }
         } catch { /* SHOW 失败降级 */ }
         try {
@@ -281,7 +281,7 @@ class Neo4jDialect extends GraphDialect {
             const types = f[3] as string[] | null;
             if (!Array.isArray(types) || !types.includes(graphName)) continue;
             for (const p of (f[4] ?? []) as string[]) if (String(f[1]).toUpperCase().includes("UNIQUE")) uniqueProps.add(p);
-            indexLines.push(`${f[0]}(${f[1]}) ON ${types.join(":")}.(${(f[4] ?? []).join(",")})`);
+            indexLines.push(`${f[0]}(${f[1]}) ON ${types.join(":")}.(${((f[4] ?? []) as string[]).join(",")})`);
           }
         } catch { /* 降级 */ }
 

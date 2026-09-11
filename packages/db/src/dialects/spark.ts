@@ -58,7 +58,8 @@ class SparkDialect extends BigDataDialect {
   }
 
   protected async doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection> {
-    const client = new hive.HiveClient(TCLIService, TCLIService_types);
+    // 同 hive.ts：上游 hive-driver 的 TCLIServiceTypes 声明不完整，仅放宽类型断言，不动运行时。
+    const client = new hive.HiveClient(TCLIService, TCLIService_types as any);
     await client.connect(
       { host: config.host ?? "localhost", port: config.port ?? DEFAULT_PORT },
       new hive.connections.TcpConnection(),

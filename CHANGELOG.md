@@ -2,7 +2,24 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [1.3.0] - 2026-09-12
+## [1.3.1] - 2026-09-11
+
+### Fixed（packages/db）
+
+- **类型标签补全**：`shortTypeLabel` / `fullTypeLabel` 补齐 dm/redis/elasticsearch/hive/spark——此前这五种静默 fallback 成原始小写 id，污染 AI 系统提示与 `db_connections` 输出（如 Redis 显示为 `名称[redis] - redis`）。键类型改用 `Record<DbTypeId, ...>`，新增方言漏补标签将在类型检查阶段报错，不再静默降级
+- **AI 系统提示家族语义补全**：`familyHint` 补齐 redis（SCAN 提示）/elasticsearch（仅读端点）/hive/spark，并将**达梦（dm）归入关系型**
+- **package.json**：删除重复声明的 `neo4j-driver` 依赖
+- **25 项既有类型错误清零**（`pnpm typecheck` 首跑 25 → 0），全部为类型层修复、**运行时行为不变**。其中有实际意义的两处：
+  - `core/scan/validate.ts`：`bag` 由 `Partial<CandidateInput>` 改为 `Partial<ConnConfig>`，避免端口范围校验退化为字符串比较
+  - `dialects/oracle.ts`：`listTables` 显式标注 `TableInfo[]`，修复泛型回退丢失 `type`/`description` 字段的问题
+- 其余类型修复：`index.ts` 工具返回补 `details: undefined`（与「不提供该字段」运行时等价，刻意不用 `{}`）；mysql/dm/hive/spark/redis/es/neo4j 方言补最小类型断言（上游类型定义缺失，均附注释）；新增 `types/upstream-shims.d.ts` 为无类型的 `oracledb` 声明最小契约
+
+### Added
+
+- **类型检查落地**：`pnpm --filter @nsyan/db typecheck`（新增 devDeps `typescript` / `@types/node` / `@earendil-works/pi-coding-agent` + `tsconfig.typecheck.json`）。刻意使用非默认配置名——`tsx --test` 会读取默认 `tsconfig.json`，导致测试解析被破坏。`--frozen-lockfile` 已可跑通，具备接入 CI 的条件（workflow 尚未添加）
+- **回归测试**：类型标签遍历断言（新增方言漏补即失败）+ Redis SCAN 调用形态断言。测试总数 128 → 133
+
+## [1.3.0] - 2026-09-11
 
 ### Changed（packages/db）—— 扫描建连重构为会话 AI 驱动
 
@@ -18,7 +35,7 @@
 - 测试：新增候选校验/防幻觉/文件树单测（128 条全绿）；旧正则提取测试随代码删除
 - **配置中心支持（Route A，零代码）**：scan_project_configs 指令引导 AI 两跳提取——发现 bootstrap.yml 指向 Nacos/Apollo/Spring Cloud Config 时，用其地址凭据调 Open API（Nacos：login 拿 accessToken → cs/configs 拉 dataId 原文）拉取远端配置后再提取候选，校验/确认流程照常
 
-## [1.2.1] - 2026-09-12
+## [1.2.1] - 2026-09-11
 
 ### Fixed（packages/db）
 
@@ -31,7 +48,7 @@
 - 发布元数据: package.json 补 repository 字段指向 GitHub 仓库，pi.dev gallery 详情页可展示 repo 链接
 - 发布配置: 版本号 1.2.1，重发触发 pi.dev 目录重索引（issue #6991 实测重发后约 2.5h 收录）
 
-## [1.2.0] - 2026-09-12
+## [1.2.0] - 2026-09-11
 
 ### Added（packages/db）
 

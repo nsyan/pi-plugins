@@ -1,7 +1,7 @@
 // src/dialects/oracle.ts
 import oracledb from "oracledb";
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
-  ListTablesResult, DescribeTableResult, ColumnInfo, TestConnectionResult } from "../core/types.js";
+  ListTablesResult, DescribeTableResult, TableInfo, ColumnInfo, TestConnectionResult } from "../core/types.js";
 import { RelationalDialect } from "./relational-dialect.js";
 import { register, filterTables, type Fingerprints } from "./dialect.js";
 
@@ -107,7 +107,9 @@ class OracleDialect extends RelationalDialect {
            WHERE T.OWNER NOT IN ('SYS', 'SYSTEM', 'DBSNMP', 'XDB')
            ORDER BY T.OWNER, T.TABLE_NAME`,
         );
-        const all = (res.rows ?? []).map((r: any) => ({
+        // 显式标注 TableInfo[]：oracledb 无类型声明，res.rows 退化为 any，若不标注则
+        // filterTables 的泛型会回退到约束 { name; schema? }，丢失 type/description 两个字段。
+        const all: TableInfo[] = (res.rows ?? []).map((r: any) => ({
           schema: r[1],
           name: r[0],
           type: "TABLE",
