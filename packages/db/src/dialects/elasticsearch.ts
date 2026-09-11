@@ -7,19 +7,27 @@ import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
 import { SearchDialect, type DslKind } from "./search-dialect.js";
 import { register, filterTables, type Fingerprints } from "./dialect.js";
 
-// ── URL 解析：http(s)://host:port（认证走账号/密码字段，API Key 二期）───
-const ES_RE = /^(https?):\/\/([^:/?#@]+)(?::(\d+))?(\/.*)?$/;
+// ── URL 解析：http(s)://[user:pass@]host:port（认证解出后归一化到 username/password，API Key 二期）───
+const ES_RE = /^(https?):\/\/(?:([^:/?#@]*)(?::([^@]*))?@)?([^:/?#@]+)(?::(\d+))?(\/.*)?$/;
 
 function parseEsUrl(url: string): ParsedTarget | null {
   const clean = url.split("?")[0].replace(/\/+$/, "");
   const m = clean.match(ES_RE);
   if (!m) return null;
-  const host = m[2];
+  const host = m[4];
   const defaultPort = m[1] === "https" ? 443 : 9200;
-  const port = m[3] ? parseInt(m[3], 10) : defaultPort;
+  const port = m[5] ? parseInt(m[5], 10) : defaultPort;
   const ssl = m[1] === "https";
   if (!host) return null;
-  return { host, port, ssl };
+  const out: ParsedTarget = { host, port, ssl };
+  // userinfo 段（可能含 URL 编码密码）解出归一化，供扫描建连/测连直接用
+  if (m[2] !== undefined) {
+    try { out.username = decodeURIComponent(m[2]); } catch { out.username = m[2]; }
+  }
+  if (m[3] !== undefined) {
+    try { out.password = decodeURIComponent(m[3]); } catch { out.password = m[3]; }
+  }
+  return out;
 }
 
 /** 从 `version.number`（如 "7.17.0"）取大版本号 */

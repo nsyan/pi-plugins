@@ -46,18 +46,46 @@
 - `强制只读` 的连接**无视全局只读开关**，永远只接受查询；AI 侧写入会被拒并提示原因
 - 典型用法：全局允许写（开发库随便改），生产库连接强制只读
 
-## 🔎 扫描建连（/db scan）
+## 🔎 扫描建连（会话 AI 驱动，v1.3.0 重构）
 
-从项目源码自动抽取连接信息（Spring `application*.yml/properties`、`docker-compose.yml`、`.env`、通用 URL 正则）：
+扫描建连已从"正则匹配"重构为"**会话 AI 提取**"：插件不再用文件名模式/键名正则猜测配置（v1.2 及以前的 Spring 键映射、baomidou dynamic-datasource 解析、占位符 `.env` 回退等提取代码已删除），改为把项目文件树交给会话模型，由 AI 自行定位并阅读配置文件——**语言无关**（Java/Python/Go/TS/Rust 的 yml/toml/env/ini/json/硬编码均可识别），`${POSTGRES-IP:10.2.12.50}` 这类占位符、Nacos 导出、K8s manifest 等长尾格式天然理解。
 
-```bash
-/db scan            # 扫描当前工作目录
-/db scan ./backend  # 扫描指定子目录（越界拒绝）
+**用法**（在会话对话框直接说）：
+
+```
+连一下这个项目的数据库        # 全类型扫描
+/db scan 配置pg              # 只提取 PostgreSQL（类型词中英文均可）
+/db scan 只看 redis 和 neo4j  # 多类型
 ```
 
-- 结果状态：✅ 可直接建 / ✏️ 待补字段 / 🔒 jasypt 加密（只标注不建）/ ⏭️ 同名已存在
-- **绝不静默建连、绝不静默覆盖**：逐个确认后才写入；占位符 `${KEY:default}` 取 default，`${KEY}` 依次查同目录 `.env` → 进程环境变量
-- AI 侧说「连一下这个项目的数据库」会调用 `scan_project_configs` 展示**掩码后**候选，建连仍需终端确认
+**流程**：
+
+1. AI 调用 `scan_project_configs` 获取项目文件树（path 强制限定当前工作目录子树内，越界拒绝）
+2. AI 从树中挑出可能含连接配置的文件，用自带读文件工具阅读，提取候选（类型/host/端口/库名/账号/密码/连接串）
+3. AI 调用 `db_scan_save` 提交候选——工具逐个弹确认框：确认 → 补录缺字段 → **测试连接通过才写盘**；同名连接三选一（覆盖/改名/跳过）
+4. 被拒绝的候选（url 与类型矛盾等）AI 会按返回原因修正后重提
+
+**防幻觉校验**（确定性规则，AI 不可绕过）：dialectId 必须在支持列表内；带 `url` 的候选必须能被对应方言 `parseUrl` 解析（解析成功后以 URL 为准）；host 必填、port 范围 1~65535。
+
+**结果状态**：✅ 可直接建 / ✏️ 待补字段（确认框中补录）/ ⏭️ 同名已存在。
+
+### 配置中心场景（Nacos / Apollo / Spring Cloud Config）
+
+当连接配置不在本地文件、而在配置中心时（特征：`bootstrap.yml` 含 `spring.cloud.nacos.config` 或类似的配置中心指向），AI 会自动走"两跳"提取：
+
+1. 从 `bootstrap.yml` 读取配置中心地址与凭据（server-addr / username / password / namespace / group）
+2. 用会话自带的命令工具调 Open API 拉取配置原文——Nacos 为例：
+   ```bash
+   # 登录拿 accessToken
+   curl -X POST "http://<server>/nacos/v1/auth/login" -d "username=<u>&password=<p>"
+   # 拉取配置（tenant = namespace 的 UUID，group/file-extension 与 bootstrap 对应）
+   curl "http://<server>/nacos/v1/cs/configs?dataId=<服务名>.yaml&group=dev&tenant=<namespace>&accessToken=<token>"
+   ```
+3. 从返回的 YAML 原文提取连接候选 → `db_scan_save` 提交（校验/确认/测试连接照常）
+
+本地 profile 文件（如 `application-dev.yml`）与配置中心共有的项目，两边都会被提取，重复的连接靠同名查重（⏭️ exists 状态）与确认框兜底。
+
+**隐私行为变化**（v1.3.0，用户知情接受）：配置文件原文（含密码）会随 AI 阅读进入会话上下文；v1.2 及以前"密码只在终端补录、不进模型上下文"的承诺不再适用于扫描场景（查询/连接管理不受影响）。
 
 ## 🧾 各家族 sql 形态详解
 
@@ -122,7 +150,6 @@ SHOW INDEXES
 - **结果拍平**：Node 渲染为 `:Label {属性}`，Relationship 为 `-(TYPE)-> {属性}`，Path 为 `<path:n>`；无返回记录的写语句回显变更计数（创建节点 n，设置属性 m）
 - **limit 封顶**：客户端截断对齐关系型方言（不做 Cypher LIMIT 注入，任意语句尾部加 LIMIT 不总合法）
 - **连接串**：`bolt://`/`neo4j://`/`bolt+s://`/`neo4j+s://` 等；建连统一走 Bolt 直连（`bolt://`/`bolt+s://`）——单机社区版无路由服务，`neo4j://` 路由 scheme 会报 No routing servers available；URL 路径段 = 图数据库名（缺省 `neo4j`）
-- **扫描建连**：Spring `spring.neo4j.uri`（Boot 3）/ `spring.data.neo4j.uri`（Boot 2）+ authentication 账号密码键、`.env` `NEO4J_URI`/`NEO4J_URL`/`BOLT_URL`、docker-compose `neo4j` 镜像（`NEO4J_AUTH`/`NEO4J_PASSWORD`）、通用 URL 正则
 
 ## ✍️ 写操作：理由与审计
 

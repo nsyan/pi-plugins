@@ -37,14 +37,28 @@ export interface ParsedTarget {
 export interface DbConnection { type: DbTypeId; client: unknown; close(): Promise<void>; }
 export interface ExecOpts { readonly: boolean; maxRows: number; timeoutSec: number; }
 
-// scan/candidates.ts
-export type CandidateStatus = "ready" | "incomplete" | "encrypted" | "exists";
+// scan（v1.3.0：文件发现与提取交给会话模型，本层只做校验归一化）
+export type CandidateStatus = "ready" | "incomplete" | "exists";
+/** 模型经 db_scan_save 提交的原始候选形状 */
+export interface CandidateInput {
+  dialectId: DbTypeId;
+  host?: string; port?: number | string;
+  username?: string; password?: string;
+  database?: string; dbIndex?: number | string;
+  /** 完整连接串（可选；提供时必须能被方言 parseUrl 解析，否则整条拒绝——防幻觉） */
+  url?: string;
+  name?: string;
+  /** 来源描述（如配置文件相对路径），展示用 */
+  source?: string;
+  warnings?: string[];
+}
 export interface Candidate {
   status: CandidateStatus;
-  dialectId: DbTypeId;              // 由方言 fingerprints 匹配得出
-  partial: Partial<ConnConfig>;     // 已抽到的字段
+  dialectId: DbTypeId;
+  partial: Partial<ConnConfig>;     // 归一化后的字段（含默认 name）
   missing: string[];                // 待补字段名（incomplete 时）
-  source: { file: string; profile?: string; confidence: number };
+  source: string;                   // 来源描述
+  warnings?: string[];
 }
 
 // ── 以下从 src/db.ts 原样搬入（字段不变） ──────────

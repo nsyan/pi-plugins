@@ -2,7 +2,27 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0] - 2026-09-12
+
+### Changed（packages/db）—— 扫描建连重构为会话 AI 驱动
+
+**Breaking**：正则提取层整体废弃（v1.2 及以前的 Spring 键映射/baomidou 解析/占位符 `.env` 回退/docker 镜像识别/通用 URL 正则删除），文件发现与配置提取全部交给会话模型：
+
+- **`scan_project_configs` 重构**：不再返回掩码候选，改为返回项目文件树（语言无关，Java/Py/Go/TS/Rust 均覆盖）；会话 AI 自行判断哪些文件含连接配置并用自带读文件工具阅读、提取候选
+- **新增 `db_scan_save` 工具**：AI 提交提取的候选，工具逐个弹确认框（确认 → 补录缺字段 → 测试连接通过才写盘；同名三选一），扫描建连全程会话内闭环，无需终端
+- **`/db scan` 参数**：支持自然语言类型筛选——「/db scan 配置pg」「只看 redis 和 neo4j」由会话模型理解并过滤（无参数 = 全类型）；终端 `/db scan` 命令改为引导提示（提取已迁移会话）
+- **防幻觉校验**（`validate.ts` 纯函数）：dialectId 必须在注册表内；带 url 的候选必须能被方言 parseUrl 解析（claim 与 url 矛盾整条拒绝，解析成功后以 URL 为准）；host 必填、port 1~65535；同名候选标 exists
+- **修复（随重构消失）**：baomidou dynamic-datasource URL 含 `${POSTGRES-IP:10.2.12.50}` 占位符时旧正则路由失败导致 PG/DM 整库漏扫的 Bug（AI 提取不受占位符影响，根因消除）
+- **隐私行为变化（用户知情接受）**：配置文件原文（含密码）随 AI 阅读进入会话上下文；v1.2 及以前"密码不进模型上下文"的承诺不再适用于扫描场景
+- 确定性设施保留：walker 目录遍历（排除 node_modules/target 等）、方言 parseUrl（粘贴连接串与防幻觉校验共用）、各家族 REQUIRED 必填字段表
+- 测试：新增候选校验/防幻觉/文件树单测（125 条全绿）；旧正则提取测试随代码删除
+- **配置中心支持（Route A，零代码）**：scan_project_configs 指令引导 AI 两跳提取——发现 bootstrap.yml 指向 Nacos/Apollo/Spring Cloud Config 时，用其地址凭据调 Open API（Nacos：login 拿 accessToken → cs/configs 拉 dataId 原文）拉取远端配置后再提取候选，校验/确认流程照常
+
 ## [1.2.1] - 2026-09-12
+
+### Fixed（packages/db）
+
+- ES方言: 修复 parseUrl 不支持带凭据 URL（`http://user:pass@host:port`，密码 URL 编码自动解码），userinfo 解出后归一化到 username/password——此前这类 URL 会被扫描校验层当幻觉拒绝
 
 ### Changed（packages/db）
 

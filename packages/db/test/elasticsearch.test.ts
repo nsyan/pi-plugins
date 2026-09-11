@@ -8,6 +8,28 @@ describe("pickMajor", () => {
   it("parses 8.12.1 -> 8", () => assert.equal(pickMajor("8.12.1"), 8));
 });
 
+describe("es parseUrl", () => {
+  it("parses plain url without credentials", () => {
+    assert.deepEqual(esDialect.parseUrl("http://10.2.15.249:19200"),
+      { host: "10.2.15.249", port: 19200, ssl: false });
+  });
+  it("extracts userinfo with url-encoded password（扫描 .env 带凭据 URL）", () => {
+    const r = esDialect.parseUrl("http://elastic:hxsjzt%402025@10.2.15.249:19200")!;
+    assert.equal(r.host, "10.2.15.249");
+    assert.equal(r.port, 19200);
+    assert.equal(r.username, "elastic");
+    assert.equal(r.password, "hxsjzt@2025");
+  });
+  it("extracts username-only userinfo and https default port", () => {
+    const r = esDialect.parseUrl("https://elastic@es.example.com")!;
+    assert.equal(r.host, "es.example.com");
+    assert.equal(r.port, 443);
+    assert.equal(r.ssl, true);
+    assert.equal(r.username, "elastic");
+    assert.equal(r.password, undefined);
+  });
+});
+
 describe("es isAllowed", () => {
   it("allows search DSL in readonly", () => {
     assert.equal(esDialect.isAllowed(JSON.stringify({ query: { match_all: {} } }), true).ok, true);

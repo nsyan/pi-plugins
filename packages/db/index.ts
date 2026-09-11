@@ -4,7 +4,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registry } from "./src/dialects/index.js";
 import { decide, effectiveReadonly, writeRequiresReason } from "./src/core/policy.js";
 import { appendAuditLog } from "./src/core/audit.js";
-import { scanProject } from "./src/core/scan/candidates.js";
+import { collectTree } from "./src/core/scan/tree.js";
+import { validateCandidates } from "./src/core/scan/validate.js";
 import type { Candidate, ConnConfig, DbTypeId } from "./src/core/types.js";
 import {
   loadConfigs, saveConfigs, loadPluginConfig, savePluginConfig, getConfigSummary,
@@ -68,8 +69,12 @@ function familyHint(c: ConnConfig): string {
 // 系统提示触发词文案（Spec §8.5：AI 侧入口；建连写盘前必须经用户确认）
 const SCAN_TRIGGER_HINT = [
   "[项目扫描建连]",
-  "当用户说“连一下这个项目的数据库”“帮我把这项目的库配上”等时，调用 scan_project_configs 工具扫描项目连接候选（返回掩码结果，不写盘）。",
-  "建连写盘前必须经用户在终端确认（/db scan），密码类字段只在终端 TUI 补录，不进模型上下文。",
+  "当用户说“连一下这个项目的数据库”“帮我把这项目的库配上”“/db scan”等时，走两步 AI 扫描流程：",
+  "第 1 步：调用 scan_project_configs 获取项目文件树（path 必须在当前工作目录子树内，越界拒绝）；",
+  "第 2 步：从树中自行判断哪些文件可能包含数据库连接配置（任意语言：Spring/Py/Go/TS/Rust 的 yml/toml/env/ini/json 等都算），用自带读文件工具阅读它们，",
+  "  从中提取连接候选（类型/host/端口/库名/账号/密码），用户说“只要 pg”这类话时只提取对应类型；",
+  "第 3 步：调用 db_scan_save 提交候选——工具会弹确认框，用户逐个确认并补录密码后才写盘，绝不静默建连。",
+  "注意：配置文件中的密码会随文件内容进入会话上下文（用户已接受）；候选提交后由工具校验（url 必须能被方言解析，否则被拒），被拒时根据原因修正后重提。",
 ].join("\n");
 
 function buildDbListHint(configs: ConnConfig[], cfg: PluginConfig): string {
@@ -113,22 +118,15 @@ function buildDbListHint(configs: ConnConfig[], cfg: PluginConfig): string {
   ].join("\n");
 }
 
-// scan 候选状态图标（Spec §8.5：✅ 可直接建 / ✏️ 待补字段 / 🔒 加密密码 / ⏭️ 已存在）
+// scan 候选状态图标（✅ 可直接建 / ✏️ 待补字段 / ⏭️ 同名已存在）
 const SCAN_GLYPH: Record<Candidate["status"], string> = {
-  ready: "✅", incomplete: "✏️", encrypted: "🔒", exists: "⏭️",
+  ready: "✅", incomplete: "✏️", exists: "⏭️",
 };
-
-// 密码掩码（输出层红线）：真实密码不进模型上下文；jasypt ENC( 密文保留（非明文，可用信号）
-function maskCandidate(c: Candidate): Candidate {
-  const p = { ...c.partial };
-  if (typeof p.password === "string" && p.password && !p.password.startsWith("ENC(")) p.password = "***";
-  return { ...c, partial: p };
-}
 
 function candidateLine(c: Candidate): string {
   const p = c.partial;
   const miss = c.missing.length ? `，缺: ${c.missing.join("/")}` : "";
-  return `${SCAN_GLYPH[c.status]} [${c.status}] ${p.name} (${c.dialectId}) ${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}${miss} <- ${c.source.file}（置信度 ${c.source.confidence}）`;
+  return `${SCAN_GLYPH[c.status]} [${c.status}] ${p.name} (${c.dialectId}) ${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}${miss} <- ${c.source}`;
 }
 
 // ── 导出扩展 ──────────────────────────────────────
@@ -136,88 +134,63 @@ function candidateLine(c: Candidate): string {
 // scan 向导核心（由 registerCommand 内的 scanWizard 调用；需要 ctx.ui）
 
 export default function (pi: ExtensionAPI) {
-  // ── 代码扫描建连向导（/db scan，Spec §8.5）──────
-  // 硬性原则：绝不静默建连（每次写盘前确认）；绝不静默覆盖（同名三选一）；
-  // jasypt ENC 只标注不建；密码类字段只在此 TUI 通道补录。
-  const scanWizard = async (ctx: any, scanPath: string) => {
-    let candidates: Candidate[];
-    try {
-      candidates = await scanProject(scanPath);
-    } catch (err) {
-      ctx.ui.notify(`扫描失败: ${err instanceof Error ? err.message : String(err)}`, "error");
-      return;
-    }
-    if (candidates.length === 0) {
-      ctx.ui.notify(`在 ${scanPath} 未扫出数据库连接候选`, "info");
-      return;
-    }
-
-    // 1. 分组展示
-    ctx.ui.notify(
-      `扫描到 ${candidates.length} 个连接候选:\n${candidates.map(candidateLine).join("\n")}\n\n接下来逐个确认，不会静默建连。`,
-      "info",
+  // ── AI 候选落地（v1.3.0：scan_project_configs 返回文件树 → 会话模型提取 → db_scan_save 提交）───
+  // 硬性原则不变：绝不静默建连（每个候选写盘前 confirm）；绝不静默覆盖（同名三选一）；
+  // 缺字段在确认框交互中补录；testConnection 通过才保存。
+  const confirmAndSaveCandidate = async (ctx: any, cand: Candidate): Promise<"saved" | "skipped" | "failed"> => {
+    const p = cand.partial;
+    let name = p.name!;
+    const ok = await ctx.ui.confirm(
+      "AI 扫描建连",
+      `添加 ${name} (${cand.dialectId})？\n${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}\n来源: ${cand.source}`,
     );
+    if (!ok) return "skipped";
 
-    // 2. 逐个确认
-    for (const cand of candidates) {
-      if (cand.status === "encrypted") {
-        ctx.ui.notify(
-          `🔒 ${cand.partial.name}: 检测到 jasypt 加密密码（${cand.source.file}），不自动建连。请人工解密后用 /db add 手动添加。`,
-          "info",
-        );
-        continue;
-      }
-      const ok = await ctx.ui.confirm("扫描建连", `添加 ${cand.partial.name} (${cand.dialectId})？\n来源: ${cand.source.file}`);
-      if (!ok) continue;
-
-      let name = cand.partial.name!;
-      if (loadConfigs().some((x) => x.name === name)) {
-        const how = await ctx.ui.select(`同名配置已存在: ${name}`, ["覆盖", "改名", "跳过"]);
-        if (!how || how === "跳过") continue;
-        if (how === "改名") {
-          name = (await ctx.ui.input("新名称", name))?.trim() || name;
-          // 改名后仍需查重：新名若也撞车，退回三选一（绝不静默覆盖）
-          while (loadConfigs().some((x) => x.name === name)) {
-            const again = await ctx.ui.select(`新名称 ${name} 也已存在`, ["覆盖", "再改一次", "跳过"]);
-            if (!again || again === "跳过") { name = ""; break; }
-            if (again === "再改一次") {
-              name = (await ctx.ui.input("新名称", name))?.trim() || name;
-              continue;
-            }
-            break; // 覆盖
+    if (loadConfigs().some((x) => x.name === name)) {
+      const how = await ctx.ui.select(`同名配置已存在: ${name}`, ["覆盖", "改名", "跳过"]);
+      if (!how || how === "跳过") return "skipped";
+      if (how === "改名") {
+        name = (await ctx.ui.input("新名称", name))?.trim() || name;
+        while (loadConfigs().some((x) => x.name === name)) {
+          const again = await ctx.ui.select(`新名称 ${name} 也已存在`, ["覆盖", "再改一次", "跳过"]);
+          if (!again || again === "跳过") { name = ""; break; }
+          if (again === "再改一次") {
+            name = (await ctx.ui.input("新名称", name))?.trim() || name;
+            continue;
           }
-          if (name === "") continue;
+          break; // 覆盖
         }
+        if (name === "") return "skipped";
       }
-
-      // 缺字段追问（仅 TUI；密码在此补录，不进模型上下文）
-      const bag: Partial<ConnConfig> = { ...cand.partial, name };
-      for (const f of cand.missing) {
-        const v = (await ctx.ui.input(`补充 ${f}（${name}）`, ""))?.trim();
-        if (v !== undefined && v !== "") {
-          (bag as Record<string, unknown>)[f] = f === "port" || f === "dbIndex" ? parseInt(v, 10) : v;
-        }
-      }
-
-      const dialect = registry.get(cand.dialectId);
-      if (!dialect) continue;
-      const conn: ConnConfig = { id: randomUUID(), createdAt: new Date().toISOString(), type: cand.dialectId, ...bag } as ConnConfig;
-
-      // 3. 逐个 testConnection → 成功保存，失败给可操作建议
-      ctx.ui.notify(`正在测试 ${dialect.label} 连接...`, "info");
-      const result = await dialect.testConnection(toRuntimeConfig(conn, dialect.defaultPort));
-      if (!result.success) {
-        ctx.ui.notify(`连接失败: ${result.error}\n未保存。请检查网络/账号后重跑 /db scan，或用 /db add 手动添加。`, "error");
-        continue;
-      }
-      ctx.ui.notify(`连接成功 (${result.version}${result.warning ? "，警告: " + result.warning : ""}, ${result.latency})`, "success");
-      const all = loadConfigs();
-      const idx = all.findIndex((x) => x.name === name);
-      if (idx >= 0) all[idx] = conn; else all.push(conn);
-      saveConfigs(all);
-      recordTestResult(name, result);
-      ctx.ui.notify(`配置已保存: ${name}`, "success");
     }
+
+    // 缺字段追问（TUI 通道补录）
+    const bag: Partial<ConnConfig> = { ...p, name };
+    for (const f of cand.missing) {
+      const v = (await ctx.ui.input(`补充 ${f}（${name}）`, ""))?.trim();
+      if (v !== undefined && v !== "") {
+        (bag as Record<string, unknown>)[f] = f === "port" || f === "dbIndex" ? parseInt(v, 10) : v;
+      }
+    }
+
+    const dialect = registry.get(cand.dialectId);
+    if (!dialect) return "failed";
+    const conn: ConnConfig = { id: randomUUID(), createdAt: new Date().toISOString(), type: cand.dialectId, ...bag } as ConnConfig;
+
+    ctx.ui.notify(`正在测试 ${dialect.label} 连接...`, "info");
+    const result = await dialect.testConnection(toRuntimeConfig(conn, dialect.defaultPort));
+    if (!result.success) {
+      ctx.ui.notify(`连接失败: ${result.error}\n未保存。请检查网络/账号后重试，或用 /db add 手动添加。`, "error");
+      return "failed";
+    }
+    ctx.ui.notify(`连接成功 (${result.version ?? ""}${result.warning ? "，警告: " + result.warning : ""}, ${result.latency})`, "success");
+    const all = loadConfigs();
+    const idx = all.findIndex((x) => x.name === name);
+    if (idx >= 0) all[idx] = conn; else all.push(conn);
+    saveConfigs(all);
+    recordTestResult(name, result);
+    ctx.ui.notify(`配置已保存: ${name}`, "success");
+    return "saved";
   };
 
   // ── 添加数据库连接（P0：一键连接串 / 家族分支逐步表单，Spec §7/§11.1）───
@@ -754,7 +727,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；写操作必须在 reason 参数说明动机与影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"），否则会被拒绝。database 参数取系统提示「可用数据库」列表中的名称（缺省走默认连接）。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
       database: Type.Optional(Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称；缺省走默认连接）" })),
-      sql: Type.String({ description: "语句；关系型填 SQL，MongoDB 填 JSON 命令信封，Redis 填命令，ES 填 DSL，Neo4j 填 Cypher" }),,
+      sql: Type.String({ description: "语句；关系型填 SQL，MongoDB 填 JSON 命令信封，Redis 填命令，ES 填 DSL，Neo4j 填 Cypher" }),
       reason: Type.Optional(Type.String({ description: "执行理由，写操作必填：动机+影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"）。读操作无需填写" })),
     }),
     async execute(_toolCallId: string, params: { database?: string; sql: string; reason?: string }, _signal: any, _onUpdate?: any, ctx?: any) {
@@ -968,28 +941,30 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // 工具 4: scan_project_configs（Spec §8.5 AI 侧入口；只返回掩码候选，不写盘）
+  // 工具 4: scan_project_configs（v1.3.0：返回项目文件树，提取交给会话模型）
   pi.registerTool({
     name: "scan_project_configs",
     label: "扫描项目数据库配置",
-    description: "扫描项目源码（Spring 配置 / docker-compose / .env 等）抽取数据库连接候选。只返回掩码后的候选列表，绝不写盘；建连请让用户在终端执行 /db scan 完成。",
-    promptSnippet: "当用户说“连一下这个项目的数据库”“帮我把这项目的库配上”等时调用。返回掩码候选与状态（可直接建/待补/加密/已存在）；把结果展示给用户后，引导其在终端用 /db scan 完成建连。path 必须在当前工作目录子树内。",
+    description: "获取项目文件树，供 AI 自行定位并阅读数据库连接配置文件（任意语言：Spring/Py/Go/TS/Rust 的 yml/toml/env/ini/json 等均覆盖）。本身不做提取；提取结果用 db_scan_save 提交。",
+    promptSnippet: "当用户说「连一下这个项目的数据库」「帮我把这项目的库配上」「/db scan 配置pg」等时调用第 1 步。返回项目文件树后：自己判断哪些文件可能含数据库连接配置（用户指了类型就只找该类型），用自带读文件工具阅读，提取连接候选（类型/host/端口/库名/账号/密码），然后调用 db_scan_save 提交。path 必须在当前工作目录子树内。",
     parameters: Type.Object({
       path: Type.Optional(Type.String({ description: "扫描根目录，缺省为当前工作目录；强制限定在当前工作目录子树内，越界拒绝" })),
     }),
     async execute(_toolCallId: string, params: { path?: string }, _signal: any) {
       try {
-        const candidates = (await scanProject(params.path ?? ".")).map(maskCandidate);
-        if (candidates.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: `在 ${params.path ?? "当前目录"} 未扫出数据库连接候选。可建议用户用 /db add 手动添加。` }],
-          };
-        }
+        const tree = collectTree(params.path ?? ".");
         const text = [
-          `扫描到 ${candidates.length} 个连接候选（密码已掩码，不写盘）：`,
-          ...candidates.map(candidateLine),
+          `项目根目录: ${tree.root}（文件总数 ${tree.total}${tree.truncated ? "，已截断展示前 " + tree.lines.length + " 条" : ""}）`,
           "",
-          "建连写盘需用户确认：请引导用户在终端执行 /db scan 完成逐个确认与密码补录。",
+          "文件树（相对路径，浅层优先）：",
+          ...tree.lines,
+          "",
+          "下一步（必须执行）：",
+          "1. 从文件树中判断哪些文件可能包含数据库连接配置——任意语言/格式都算：Spring application*.yml、Python settings/config.py、Go config.yaml、Node .env、Rust .env+config.toml、docker-compose、K8s manifest 等；",
+          "2. 用你的读文件工具阅读这些文件；若发现 bootstrap.yml/application.yml 指向配置中心（nacos/apollo/spring-cloud-config），用配置中心地址与凭据拉取远端配置后再提取——例如 Nacos：先用 POST {server}/nacos/v1/auth/login（form: username/password）拿 accessToken，再 GET {server}/nacos/v1/cs/configs?dataId=<服务名>.yaml&group=<group>&tenant=<namespace-id>&accessToken=<token>，返回的 YAML 原文同样提取候选；",
+          "3. 从本地/远端配置中提取连接候选：dialectId（postgresql/mysql/oracle/dm/redis/elasticsearch/mongodb/neo4j/hive/spark）、host、port、database、username、password、url（如有完整连接串）、source（来源文件或 dataId）；用户指定了类型（如「配置pg」）就只提取该类型；",
+          "4. 调用 db_scan_save 提交候选数组。带 url 的候选必须能被对应方言解析，编造的 url 会被拒绝；",
+          "5. 工具会弹确认框让用户逐个确认并补录密码，把工具返回的保存结果汇报给用户。",
         ].join("\n");
         return { content: [{ type: "text" as const, text }] };
       } catch (err) {
@@ -997,6 +972,54 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text" as const, text: `扫描失败: ${err instanceof Error ? err.message : String(err)}` }],
         };
       }
+    },
+  });
+
+  // 工具 4b: db_scan_save（v1.3.0：AI 提交提取的候选，弹框确认后写盘——会话内闭环）
+  pi.registerTool({
+    name: "db_scan_save",
+    label: "保存扫描到的数据库连接",
+    description: "接收 AI 从项目配置提取的数据库连接候选数组，逐个弹确认框（用户确认+补录缺字段+测试连接）后写盘。绝不静默建连；url 与类型矛盾的候选会被拒绝（防幻觉）。",
+    promptSnippet: "在 scan_project_configs 之后调用。candidates 传候选数组，每项含 dialectId/host/port/database/username/password/url/source；被拒绝的候选根据返回的 rejected 原因修正后可重提；把每个候选的保存结果（已保存/已跳过/失败）汇报给用户。",
+    parameters: Type.Object({
+      candidates: Type.Array(Type.Object({
+        dialectId: Type.String({ description: "数据库类型：postgresql/mysql/oracle/dm/redis/elasticsearch/mongodb/neo4j/hive/spark" }),
+        host: Type.Optional(Type.String({ description: "主机（无 url 时必填）" })),
+        port: Type.Optional(Type.Union([Type.Number(), Type.String()], { description: "端口" })),
+        database: Type.Optional(Type.String({ description: "库名/schema（按类型语义）" })),
+        username: Type.Optional(Type.String({ description: "账号" })),
+        password: Type.Optional(Type.String({ description: "密码（缺失时确认框会引导用户补录）" })),
+        url: Type.Optional(Type.String({ description: "完整连接串（可选，提供时必须能被方言解析，否则整条拒绝）" })),
+        name: Type.Optional(Type.String({ description: "连接名称（缺省自动生成）" })),
+        source: Type.Optional(Type.String({ description: "来源描述，如配置文件相对路径" })),
+      }), { description: "连接候选数组" }),
+    }),
+    async execute(_toolCallId: string, params: { candidates: unknown[] }, _signal: any, _onUpdate?: any, ctx?: any) {
+      if (!ctx?.ui) {
+        return { content: [{ type: "text" as const, text: "db_scan_save 需要交互式会话（ctx.ui 不可用）。请引导用户在终端执行 /db add 手动添加。" }] };
+      }
+      const { candidates, rejected } = validateCandidates(params.candidates, new Set(loadConfigs().map((c) => c.name)));
+      const lines: string[] = [];
+      if (rejected.length > 0) {
+        lines.push(`⛔ ${rejected.length} 个候选被拒绝（疑似编造或字段矛盾，请修正后重提）：`, ...rejected.map((r) => "  - " + r), "");
+      }
+      if (candidates.length === 0) {
+        lines.push(rejected.length > 0 ? "没有可保存的候选。" : "未收到有效候选（candidates 需为数组，每项含 dialectId+host）。",
+          "提示：从配置文件原文提取后重试；确认方言取值在支持列表内。");
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      }
+      lines.push(`收到 ${candidates.length} 个连接候选，逐个确认：`, ...candidates.map(candidateLine), "");
+      const results: string[] = [];
+      for (const cand of candidates) {
+        try {
+          const r = await confirmAndSaveCandidate(ctx, cand);
+          results.push(`${SCAN_GLYPH[cand.status]} ${cand.partial.name} (${cand.dialectId}): ${r === "saved" ? "已保存" : r === "skipped" ? "用户跳过" : "连接失败未保存"}`);
+        } catch (err) {
+          results.push(`❌ ${cand.partial.name} (${cand.dialectId}): 异常 ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      lines.push("", "保存结果：", ...results.map((r) => "  - " + r));
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     },
   });
 
@@ -1043,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
           "⚡ 切换默认",
           "✏️ 编辑连接",
           "➕ 新增连接",
-          "🔎 扫描建连",
+          "🔎 扫描建连（会话 AI）",
           "🗑️ 删除连接",
           "⚙️ 设置",
         ];
@@ -1076,8 +1099,8 @@ export default function (pi: ExtensionAPI) {
           if (config) await editDbConfig(ctx, config);
         } else if (navChoice === "➕ 新增连接") {
           await addDbConfig(ctx);
-        } else if (navChoice === "🔎 扫描建连") {
-          await scanWizard(ctx, ".");
+        } else if (navChoice === "🔎 扫描建连（会话 AI）") {
+          ctx.ui.notify("扫描建连已升级为会话 AI 驱动：请在对话框直接说「连一下这个项目的数据库」或「/db scan 配置pg」，\nAI 会读取项目配置文件并提取连接，在会话内弹框确认后建连。", "info");
         } else if (navChoice === "🗑️ 删除连接") {
           await deleteDbConfig(ctx, configs);
         }
@@ -1090,10 +1113,9 @@ export default function (pi: ExtensionAPI) {
         if (config) await editDbConfig(ctx, config);
       } else if (sub === "rm" || sub === "remove" || sub === "del" || sub === "delete" || sub === "d") {
         await deleteDbConfig(ctx, configs);
-      } else if (sub === "scan" || sub.startsWith("scan ")) {
-        // /db scan [path]：path 缺省为当前工作目录，越界由 scanProject 拒绝
-        const scanPath = args.trim().slice(4).trim() || ".";
-        await scanWizard(ctx, scanPath);
+      } else if (sub === "scan") {
+        // /db scan [自然语言]：提取已迁移到会话 AI（正则引擎已废弃），终端仅引导
+        ctx.ui.notify("扫描建连已升级为会话 AI 驱动：请在对话框直接说「连一下这个项目的数据库」或「/db scan 配置pg」。\nAI 会读取项目配置文件（任意语言）提取连接，在会话内弹框确认后建连。", "info");
       } else if (sub === "ls" || sub === "list") {
         showDbList(ctx, configs);
       } else {
@@ -1103,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
           "  edit   编辑连接\n" +
           "  rm     删除连接\n" +
           "  ls     列出所有连接\n" +
-          "  scan   扫描项目配置建连（可带路径，缺省当前目录）\n" +
+          "  scan   扫描已迁移到会话 AI：在对话框说「连一下这个项目的数据库」\n" +
           "  config 查看/修改插件设置\n" +
           "  默认    打开管理菜单（查看/编辑/新增/扫描/删除/设置）",
           "info"
