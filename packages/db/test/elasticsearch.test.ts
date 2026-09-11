@@ -1,7 +1,7 @@
 // test/elasticsearch.test.ts
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { esDialect, pickMajor } from "../src/dialects/elasticsearch.js";
+import { esDialect, pickMajor, hitsToRows } from "../src/dialects/elasticsearch.js";
 
 describe("pickMajor", () => {
   it("parses 7.17.0 -> 7", () => assert.equal(pickMajor("7.17.0"), 7));
@@ -27,6 +27,37 @@ describe("es parseUrl", () => {
     assert.equal(r.ssl, true);
     assert.equal(r.username, "elastic");
     assert.equal(r.password, undefined);
+  });
+});
+
+describe("es hitsToRows（聚合渲染与截断标注）", () => {
+  it("无命中但有聚合时展开桶为行（size:0 纯聚合查询）", () => {
+    const r = hitsToRows({ hits: { total: { value: 0, relation: "eq" }, hits: [] }, aggregations: { by_type: { buckets: [{ key: "A", doc_count: 12 }, { key: "B", doc_count: 5 }] } } });
+    assert.deepEqual(r.columns, ["aggregation", "key", "doc_count", "value"]);
+    assert.deepEqual(r.rows, [["by_type", "A", 12, null], ["by_type", "B", 5, null]]);
+    assert.equal(r.truncated, undefined);
+  });
+  it("桶内子聚合折叠进 value 列 JSON", () => {
+    const r = hitsToRows({ hits: { total: 0, hits: [] }, aggregations: { by_day: { buckets: [{ key: 100, doc_count: 3, avg: { value: 1.5 } }] } } });
+    assert.deepEqual(r.rows, [["by_day", 100, 3, JSON.stringify({ avg: { value: 1.5 } })]]);
+  });
+  it("metric 聚合取值", () => {
+    const r = hitsToRows({ hits: { total: 0, hits: [] }, aggregations: { avg_score: { value: 88.5 } } });
+    assert.deepEqual(r.rows, [["avg_score", null, null, 88.5]]);
+  });
+  it("total 大于取回行数 → truncated", () => {
+    const r = hitsToRows({ hits: { total: { value: 88, relation: "eq" }, hits: [{ _id: "1", _source: {} }] } });
+    assert.equal(r.rowCount, 88);
+    assert.equal(r.truncated, true);
+  });
+  it("全部取回 → 不标 truncated", () => {
+    const r = hitsToRows({ hits: { total: { value: 1, relation: "eq" }, hits: [{ _id: "1", _source: {} }] } });
+    assert.equal(r.truncated, false);
+  });
+  it("命中与聚合共存时保持文档视图", () => {
+    const r = hitsToRows({ hits: { total: 1, hits: [{ _id: "x", _source: { a: 1 } }] }, aggregations: { g: { value: 1 } } });
+    assert.deepEqual(r.columns, ["_id", "_source"]);
+    assert.equal(r.rows.length, 1);
   });
 });
 

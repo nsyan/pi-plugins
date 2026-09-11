@@ -144,7 +144,7 @@ class ElasticsearchDialect extends SearchDialect {
     }
   }
 
-  protected async doSearch(client: unknown, config: ConnConfig, sql: string, kind: DslKind, opts: ExecOpts): Promise<{ columns: string[]; rows: unknown[][]; rowCount: number }> {
+  protected async doSearch(client: unknown, config: ConnConfig, sql: string, kind: DslKind, opts: ExecOpts): Promise<{ columns: string[]; rows: unknown[][]; rowCount: number; truncated?: boolean }> {
     const es = client as ClientV8;
     const index = config.database;
     if (!index) throw new Error("ES 连接缺少默认 index（database 字段）");
@@ -160,7 +160,8 @@ class ElasticsearchDialect extends SearchDialect {
       if (kind.endpoint === "_count") {
         const res = await es.count({ index });
         const count = (unwrap(res) as unknown as { count?: number }).count ?? 0;
-        return { columns: ["count"], rows: [[count]], rowCount: count };
+        // rowCount 为“取回行数”（1 行 = 计数值本身），实际计数在单元格里，避免“返回 88 行”却只给一行的误读
+        return { columns: ["count"], rows: [[count]], rowCount: 1 };
       }
       if (kind.endpoint === "_mget") {
         // 注：_mget 需兼容 v7 客户端的 body 形态（本文件为 v7/v8/v9 三客户端分发），
@@ -168,8 +169,11 @@ class ElasticsearchDialect extends SearchDialect {
         const res = await es.mget({ index, body: { docs: [] } } as unknown as Parameters<ClientV8["mget"]>[0]);
         return docsToRows(unwrap(res));
       }
-      // _search：DSL 整体即 body
-      const res = await es.search({ index, body, size: opts.maxRows });
+      // _search：DSL 整体即 body；body 显式带数字 size 时不再注入顶层 size
+      // （尊重调用方分页与 size:0 纯聚合意图，否则顶层 size 会覆盖 body.size 使聚合退化为普通搜索）
+      const searchParams: Record<string, unknown> = { index, body };
+      if (typeof (body as { size?: unknown } | undefined)?.size !== "number") searchParams.size = opts.maxRows;
+      const res = await es.search(searchParams as Parameters<ClientV8["search"]>[0]);
       return hitsToRows(unwrap(res));
     }
     throw new Error(`ES 写端点 ${kind.endpoint} 需走非只读确认流程执行，本方言 executeOn 仅执行读查询`);
@@ -235,12 +239,48 @@ class ElasticsearchDialect extends SearchDialect {
 }
 
 // ── 结果转换 ──────────────────────────────
-function hitsToRows(res: unknown): { columns: string[]; rows: unknown[][]; rowCount: number } {
-  const body = res as { hits?: { total?: number | { value?: number }; hits?: Array<{ _id?: string; _source?: unknown }> } };
+interface EsHitsBody {
+  hits?: { total?: number | { value?: number }; hits?: Array<{ _id?: string; _source?: unknown }> };
+  aggregations?: Record<string, unknown>;
+}
+
+/** 搜索响应 → 行；纯聚合查询（无命中 + aggregations）展开为聚合行，命中存在时保持文档视图 */
+export function hitsToRows(res: unknown): { columns: string[]; rows: unknown[][]; rowCount: number; truncated?: boolean } {
+  const body = res as EsHitsBody;
   const hits = body.hits?.hits ?? [];
   const total = typeof body.hits?.total === "number" ? body.hits.total : (body.hits?.total?.value ?? hits.length);
+  if (hits.length === 0 && body.aggregations !== undefined
+    && body.aggregations !== null && typeof body.aggregations === "object") {
+    return aggsToRows(body.aggregations);
+  }
   const rows = hits.map((h) => [h._id, typeof h._source === "object" ? JSON.stringify(h._source) : h._source]);
-  return { columns: ["_id", "_source"], rows, rowCount: typeof total === "number" ? total : hits.length };
+  const rowCount = typeof total === "number" ? total : hits.length;
+  // total 为服务端统计（可能是 gte 下限），大于取回行数即已截断（供工具层提示与导出）
+  return { columns: ["_id", "_source"], rows, rowCount, truncated: rowCount > rows.length };
+}
+
+/** 聚合结果 → 行：列 [aggregation, key, doc_count, value]；metric 取值，桶内子聚合折叠为 value 列 JSON */
+export function aggsToRows(aggs: Record<string, unknown>): { columns: string[]; rows: unknown[][]; rowCount: number } {
+  const rows: unknown[][] = [];
+  for (const [name, agg] of Object.entries(aggs)) {
+    if (agg === null || typeof agg !== "object") { rows.push([name, null, null, agg ?? null]); continue; }
+    const buckets = (agg as { buckets?: unknown }).buckets;
+    if (Array.isArray(buckets)) {
+      for (const b of buckets) {
+        if (b === null || typeof b !== "object") { rows.push([name, b, null, null]); continue; }
+        const bucket = b as Record<string, unknown>;
+        const key = bucket.key_as_string ?? bucket.key ?? null;
+        const docCount = typeof bucket.doc_count === "number" ? bucket.doc_count : null;
+        const extra = Object.entries(bucket).filter(([k]) => k !== "key" && k !== "key_as_string" && k !== "doc_count");
+        rows.push([name, key, docCount, extra.length > 0 ? JSON.stringify(Object.fromEntries(extra)) : null]);
+      }
+      continue;
+    }
+    const metric = agg as { value?: unknown; value_as_string?: unknown };
+    if ("value" in metric) { rows.push([name, null, null, metric.value_as_string ?? metric.value ?? null]); continue; }
+    rows.push([name, null, null, JSON.stringify(agg)]);
+  }
+  return { columns: ["aggregation", "key", "doc_count", "value"], rows, rowCount: rows.length };
 }
 
 function docsToRows(res: unknown): { columns: string[]; rows: unknown[][]; rowCount: number } {

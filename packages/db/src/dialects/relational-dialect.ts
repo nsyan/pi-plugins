@@ -56,7 +56,10 @@ export abstract class RelationalDialect implements Dialect {
       await this.withConnection(config, async (conn) => {
         for (const s of stmts) last = await this.doExecute(conn.client, s, opts);
       }, opts.timeoutSec * 1000);
-      return { success: true, ...last, duration: `${Date.now() - start}ms` };
+      // 结果集被 maxRows 截断时标注（各行返回 rowCount=服务端完整行数、rows 已按 maxRows 截取）；
+      // 仅对结果集（有列）判定，写操作 rows 为空而 rowCount=影响行数，不得误标
+      const truncated = last.columns.length > 0 && last.rowCount > last.rows.length;
+      return { success: true, ...last, truncated, duration: `${Date.now() - start}ms` };
     } catch (err: unknown) {
       return { success: false, error: err instanceof Error ? err.message : String(err), duration: `${Date.now() - start}ms` };
     }

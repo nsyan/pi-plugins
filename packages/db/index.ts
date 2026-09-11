@@ -538,15 +538,15 @@ export default function (pi: ExtensionAPI) {
           if (result.rows.length > 10) {
             lines.push(`... 还有 ${result.rows.length - 10} 行`);
           }
-          if (result.rows.length > 50) {
+          if (result.rows.length > 50 || result.truncated) {
             try {
               const exp = writeQueryExport(result.columns ?? [], result.rows, `db-menu-${config.name.replace(/[^\w.-]/g, "_")}`);
-              lines.push(`完整结果已导出: ${exp.csvPath} | ${exp.jsonPath}`);
+              lines.push(`已导出取回的结果 (${result.rows.length} 行): ${exp.csvPath} | ${exp.jsonPath}`);
             } catch { /* 导出失败不影响主结果 */ }
           }
         }
         if (result.truncated) {
-          lines.push("（结果已达 maxRows 上限截断）");
+          lines.push("（结果已达 maxRows 上限截断，服务端仍有更多数据未取回）");
         }
         ctx.ui.notify(lines.join("\n"), "info");
       } else {
@@ -835,15 +835,17 @@ export default function (pi: ExtensionAPI) {
         const rows = result.rows.slice(0, 50).map((r) => r.join(" | "));
         text += [header, separator, ...rows].join("\n");
         if (result.rows.length > 50) {
-          // P0 导出：长结果落盘 /tmp（CSV+JSON），只回路径不贴全量
-          text += `\n... 还有 ${result.rows.length - 50} 行`;
+          text += `\n... 还有 ${result.rows.length - 50} 行（本次共取回 ${result.rows.length} 行）`;
+        }
+        // 取回行数超展示上限，或被 maxRows 截断时落盘 /tmp（CSV+JSON），只回路径不贴全量
+        if (result.rows.length > 50 || result.truncated) {
           try {
             const exp = writeQueryExport(result.columns ?? [], result.rows, `db-query-${config.name.replace(/[^\w.-]/g, "_")}`);
-            text += `\n完整结果已导出: ${exp.csvPath} | ${exp.jsonPath}`;
+            text += `\n已导出取回的结果 (${result.rows.length} 行): ${exp.csvPath} | ${exp.jsonPath}`;
           } catch { /* 导出失败不影响主结果 */ }
         }
         if (result.truncated) {
-          text += `\n（结果已达 maxRows 上限截断）`;
+          text += `\n（结果已达 maxRows 上限截断，服务端仍有更多数据未取回）`;
         }
       } else {
         text += "无数据返回。";

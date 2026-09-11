@@ -9,6 +9,9 @@
 - **类型标签补全**：`shortTypeLabel` / `fullTypeLabel` 补齐 dm/redis/elasticsearch/hive/spark——此前这五种静默 fallback 成原始小写 id，污染 AI 系统提示与 `db_connections` 输出（如 Redis 显示为 `名称[redis] - redis`）。键类型改用 `Record<DbTypeId, ...>`，新增方言漏补标签将在类型检查阶段报错，不再静默降级
 - **AI 系统提示家族语义补全**：`familyHint` 补齐 redis（SCAN 提示）/elasticsearch（仅读端点）/hive/spark，并将**达梦（dm）归入关系型**
 - **package.json**：删除重复声明的 `neo4j-driver` 依赖
+- **Elasticsearch 聚合结果不可见**：`hitsToRows` 只取 `hits`，聚合桶被丢弃；且插件注入的顶层 `size=maxRows` 会覆盖 body 里的 `size`，使 `size:0` 纯聚合查询退化成普通搜索返回文档。现：body 显式带数字 `size` 时不再注入顶层 size；无命中但有 `aggregations` 时展开为行（列 `aggregation/key/doc_count/value`，桶内子聚合折叠为 `value` 列 JSON，metric 取值）
+- **ES `_count` 行数误导**：“返回 N 行”里的 N 原来是计数值本身（如「返回 88 行」却只给一行），现改为 1 行（计数值在单元格里）
+- **结果截断无提示、不导出（ES + 关系型五方言）**：ES 与 PG/MySQL/DM/Oracle 都没设 `truncated`（仅 bigdata 方言有），而工具层导出/提示条件是 `rows.length > 50`，恰好等于 maxRows 时永远不触发——超限查询少给数据却无任何提示。现：关系型基类按「有列结果集 且 rowCount > rows.length」标 `truncated`（写操作不误标）；ES 按「total > 取回行数」标注；工具层与 `/db` 菜单改为在**截断或超 50 行**时落盘导出并提示“服务端仍有更多数据未取回”
 - **25 项既有类型错误清零**（`pnpm typecheck` 首跑 25 → 0），全部为类型层修复、**运行时行为不变**。其中有实际意义的两处：
   - `core/scan/validate.ts`：`bag` 由 `Partial<CandidateInput>` 改为 `Partial<ConnConfig>`，避免端口范围校验退化为字符串比较
   - `dialects/oracle.ts`：`listTables` 显式标注 `TableInfo[]`，修复泛型回退丢失 `type`/`description` 字段的问题
