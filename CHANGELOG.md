@@ -15,7 +15,7 @@
 - **修复（随重构消失）**：baomidou dynamic-datasource URL 含 `${POSTGRES-IP:10.2.12.50}` 占位符时旧正则路由失败导致 PG/DM 整库漏扫的 Bug（AI 提取不受占位符影响，根因消除）
 - **隐私行为变化（用户知情接受）**：配置文件原文（含密码）随 AI 阅读进入会话上下文；v1.2 及以前"密码不进模型上下文"的承诺不再适用于扫描场景
 - 确定性设施保留：walker 目录遍历（排除 node_modules/target 等）、方言 parseUrl（粘贴连接串与防幻觉校验共用）、各家族 REQUIRED 必填字段表
-- 测试：新增候选校验/防幻觉/文件树单测（125 条全绿）；旧正则提取测试随代码删除
+- 测试：新增候选校验/防幻觉/文件树单测（128 条全绿）；旧正则提取测试随代码删除
 - **配置中心支持（Route A，零代码）**：scan_project_configs 指令引导 AI 两跳提取——发现 bootstrap.yml 指向 Nacos/Apollo/Spring Cloud Config 时，用其地址凭据调 Open API（Nacos：login 拿 accessToken → cs/configs 拉 dataId 原文）拉取远端配置后再提取候选，校验/确认流程照常
 
 ## [1.2.1] - 2026-09-12
