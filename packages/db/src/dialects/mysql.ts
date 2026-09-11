@@ -78,7 +78,18 @@ class MysqlDialect extends RelationalDialect {
     try {
       await mysqlConn.execute(`SET max_execution_time = ${timeoutMs}`);
     } catch { /* ignore: server too old for max_execution_time */ }
-    const [rows, fields] = await mysqlConn.execute(stmt);
+    // 事务控制等语句（START TRANSACTION/BEGIN/COMMIT/ROLLBACK…）不支持 prepared 协议，
+    // mysql2 抛 ER_UNSUPPORTED_PS；此类语句降级 query()（插件从不绑定参数，语义等价）
+    let result: [unknown, unknown];
+    try {
+      result = await mysqlConn.execute(stmt);
+    } catch (err) {
+      const code = (err as { code?: string } | null)?.code ?? "";
+      const msg = err instanceof Error ? err.message : String(err);
+      if (code !== "ER_UNSUPPORTED_PS" && !/prepared statement protocol/i.test(msg)) throw err;
+      result = await mysqlConn.query(stmt);
+    }
+    const [rows, fields] = result as [{ affectedRows?: number; length?: number }, Array<{ name: string }>];
     if (Array.isArray(fields) && fields.length > 0) {
       const columns = fields.map((f: any) => f.name);
       const data = (rows as any[]).slice(0, maxRows).map((r: any) => columns.map((col: string) => r[col]));

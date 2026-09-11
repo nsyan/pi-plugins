@@ -1,6 +1,6 @@
 {
   "name": "@nsyan/db",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "AI 接入数据库扩展 —— 五大家族方言架构，支持 PostgreSQL/MySQL/Oracle/达梦/Redis/Elasticsearch/MongoDB/Hive/Spark 九种数据库，提供查询/表结构/扫描建连/连接清单工具给 LLM",
   "keywords": [
     "pi-extension",

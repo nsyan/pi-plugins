@@ -22,6 +22,14 @@ const READ_KEYS: Record<string, "_search" | "_count" | "_mget"> = {
 
 const WRITE_KEYS = ["bulk", "doc_write", "delete", "update", "mapping", "settings"];
 
+/** 无 query 键的纯检索体安全键（aggs-only / size/sort 等 _search body），按读分类 */
+const SEARCH_BODY_KEYS: ReadonlySet<string> = new Set([
+  "aggs", "aggregations", "size", "from", "sort", "_source", "fields",
+  "docvalue_fields", "stored_fields", "highlight", "suggest", "collapse",
+  "track_total_hits", "min_score", "post_filter", "indices_boost",
+  "terminate_after", "timeout", "version", "seq_no_primary_term", "explain", "knn",
+]);
+
 // `DELETE <index>` 纯字符串形式（删索引）恒拒——大小写不敏感、前导空白容忍
 const DELETE_INDEX_RE = /^\s*DELETE\s+\S+/i;
 
@@ -41,6 +49,10 @@ export function parseDsl(input: string): DslKind {
       if (WRITE_KEYS.includes(k.toLowerCase())) {
         return { type: "write", endpoint: k, detail: describeDetail(body) };
       }
+    }
+    // 纯检索体（aggs/sort/size 等无 query 键的 _search body）按读
+    if (keys.some((k) => SEARCH_BODY_KEYS.has(k.toLowerCase()))) {
+      return { type: "read", endpoint: "_search", detail: describeDetail(body) };
     }
     // JSON 但无已知信封 key——保守按写处理（未知操作的写意图不可排除）
     return { type: "write", endpoint: keys[0] ?? "unknown", detail: describeDetail(body) };
@@ -89,12 +101,15 @@ export abstract class SearchDialect implements Dialect {
       const summary = `SEARCH（${kind.endpoint}/${kind.detail || "match"}）`;
       return { ok: true, isWrite: false, summary };
     }
-    // 写端点
+    // 写端点：本方言 executeOn 仅实现读，早期明确拒绝
+    // （原先只读模式才拒、可写模式放行到确认后才报“仅执行读查询”，体验差）
     const summary = `SEARCH（${kind.endpoint}/${kind.detail || "write"}）`;
-    if (readonly) {
-      return { ok: false, reason: `只读模式下不允许执行写端点：${kind.endpoint}`, isWrite: true, summary };
-    }
-    return { ok: true, isWrite: true, summary };
+    return {
+      ok: false,
+      reason: `ES 方言仅支持读查询（_search/_count/_mget），写端点不支持：${kind.endpoint}`,
+      isWrite: true,
+      summary,
+    };
   }
 
   async executeOn(config: ConnConfig, sql: string, opts: ExecOpts): Promise<QueryResult> {

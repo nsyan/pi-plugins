@@ -40,6 +40,26 @@ function makeClient(config: ConnConfig, ClientClass: new (opts: Record<string, u
   return new ClientClass(opts);
 }
 
+/** v7 客户端响应包 { body, statusCode, headers }，v8+ 直接返回体——统一解包 */
+function unwrap<T>(res: T | { body: T }): T {
+  const r = res as { body?: unknown } | null;
+  return r !== null && typeof r === "object" && "body" in r && (r as { body?: unknown }).body !== undefined
+    ? (r as { body: T }).body
+    : (res as T);
+}
+
+/** v7 客户端探测版本（v8/v9 产品校验拒收的低版本 ES 用） */
+async function probeVersionViaV7(config: ConnConfig): Promise<string> {
+  const v7 = makeClient(config, ClientV7 as unknown as new (opts: Record<string, unknown>) => AnyClient);
+  try {
+    const info = await (v7 as ClientV7).info();
+    const body = unwrap(info) as { version?: { number?: string } };
+    return body.version?.number ?? "";
+  } finally {
+    try { await v7.close(); } catch { /* ignore */ }
+  }
+}
+
 class ElasticsearchDialect extends SearchDialect {
   id = "elasticsearch" as const;
   label = "Elasticsearch";
@@ -60,33 +80,35 @@ class ElasticsearchDialect extends SearchDialect {
   }
 
   protected async doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection> {
-    // 先用"最新客户端"做无版本探测 GET /（testConnection 与 withConnection 共用）；
-    // GET / 返回 version.number 后按大版本分发（详见 testConnection）
+    // v8/v9 客户端强制产品校验（响应须带 X-elastic-product 头，ES 7.14+ 才有），
+    // 对 7.0~7.13 直接抛 "unknown product"。探测失败回退 v7 客户端再探——双探都失败才认定不可达。
     const probe = makeClient(config, ClientV8 as unknown as new (opts: Record<string, unknown>) => AnyClient);
+    let versionNumber = "";
+    let useV7 = false;
     try {
       const info = await (probe as ClientV8).info();
-      const versionNumber = (info as unknown as { version?: { number?: string } }).version?.number ?? "";
-      const major = pickMajor(versionNumber);
-      if (major === 7) {
-        const v7 = makeClient(config, ClientV7 as unknown as new (opts: Record<string, unknown>) => AnyClient);
-        return { type: "elasticsearch", client: v7, async close() { await v7.close(); } };
-      }
-      // 8 及未知更高大版本：一律用最新客户端尝试（未知版本不硬拒，warning 由 testConnection 给出）
-      return { type: "elasticsearch", client: probe, async close() { await probe.close(); } };
-    } catch (err: unknown) {
+      versionNumber = (info as unknown as { version?: { number?: string } }).version?.number ?? "";
+    } catch {
       try { await probe.close(); } catch { /* ignore */ }
-      throw err;
+      useV7 = true;
+      versionNumber = await probeVersionViaV7(config);
     }
+    if (useV7 || pickMajor(versionNumber) === 7) {
+      try { await probe.close(); } catch { /* ignore */ }
+      const v7 = makeClient(config, ClientV7 as unknown as new (opts: Record<string, unknown>) => AnyClient);
+      return { type: "elasticsearch", client: v7, async close() { await v7.close(); } };
+    }
+    // 8 及未知更高大版本：一律用最新客户端尝试（未知版本不硬拒，warning 由 testConnection 给出）
+    return { type: "elasticsearch", client: probe, async close() { await probe.close(); } };
   }
 
   async versionQuery(conn: DbConnection): Promise<string> {
     // 连接建立时已做版本探测，这里复用一次 GET / 取完整版本号
     const client = conn.client as ClientV8;
-    const info = await client.info();
-    return (info as unknown as { version?: { number?: string } }).version?.number ?? "unknown";
+    const info = unwrap(await client.info()) as { version?: { number?: string } };
+    return info.version?.number ?? "unknown";
   }
 
-  // testConnection 复写基类：同时返回服务端版本号 + 未知大版本的 warning（Spec §12）
   async testConnection(config: ConnConfig): Promise<TestConnectionResult> {
     const start = Date.now();
     try {
@@ -95,6 +117,9 @@ class ElasticsearchDialect extends SearchDialect {
       try {
         const info = await (probe as ClientV8).info();
         versionNumber = (info as unknown as { version?: { number?: string } }).version?.number ?? "";
+      } catch {
+        // v8/v9 产品校验拒收低版本 ES（<7.14 无产品头）→ v7 客户端探测
+        versionNumber = await probeVersionViaV7(config);
       } finally {
         try { await probe.close(); } catch { /* ignore */ }
       }
@@ -121,21 +146,21 @@ class ElasticsearchDialect extends SearchDialect {
       : undefined;
     if (kind.type === "query_string") {
       const res = await es.search({ index, size: opts.maxRows, q: kind.text });
-      return hitsToRows(res);
+      return hitsToRows(unwrap(res));
     }
     if (kind.type === "read") {
       if (kind.endpoint === "_count") {
         const res = await es.count({ index });
-        const count = (res as unknown as { count?: number }).count ?? 0;
+        const count = (unwrap(res) as unknown as { count?: number }).count ?? 0;
         return { columns: ["count"], rows: [[count]], rowCount: count };
       }
       if (kind.endpoint === "_mget") {
         const res = await es.mget({ index, body: { docs: [] } });
-        return docsToRows(res);
+        return docsToRows(unwrap(res));
       }
       // _search：DSL 整体即 body
       const res = await es.search({ index, body, size: opts.maxRows });
-      return hitsToRows(res);
+      return hitsToRows(unwrap(res));
     }
     throw new Error(`ES 写端点 ${kind.endpoint} 需走非只读确认流程执行，本方言 executeOn 仅执行读查询`);
   }
@@ -146,7 +171,7 @@ class ElasticsearchDialect extends SearchDialect {
       const tables: TableInfo[] = await this.withConnection(config, async (conn) => {
         const es = conn.client as ClientV8;
         const res = await es.cat.indices({ format: "json", h: "index,health,docs.count,store.size", s: "index" });
-        const rows = (res as unknown as Array<Record<string, string>>).slice(0, 500);
+        const rows = (unwrap(res) as unknown as Array<Record<string, string>>).slice(0, 500);
         return filterTables(rows.map((r) => ({
           schema: "",
           name: r["index"] ?? "",
@@ -170,9 +195,9 @@ class ElasticsearchDialect extends SearchDialect {
         const es = conn.client as ClientV8;
         const mappingRes = await es.indices.getMapping({ index: target });
         const settingsRes = await es.indices.getSettings({ index: target });
-        const mapping = mappingRes as unknown as Record<string, { mappings?: { properties?: Record<string, { type?: string; index?: boolean; analyzer?: string }> } }>;
+        const mapping = unwrap(mappingRes) as unknown as Record<string, { mappings?: { properties?: Record<string, { type?: string; index?: boolean; analyzer?: string }> } }>;
         const props = mapping[target]?.mappings?.properties ?? {};
-        const settings = settingsRes as unknown as Record<string, { settings?: { index?: Record<string, string> } }>;
+        const settings = unwrap(settingsRes) as unknown as Record<string, { settings?: { index?: Record<string, string> } }>;
         const idxSettings = settings[target]?.settings?.index ?? {};
         const cols: ColumnInfo[] = Object.entries(props).map(([name, def]) => ({
           name,

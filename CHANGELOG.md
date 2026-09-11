@@ -13,6 +13,21 @@
 - 审计日志保留期自动清理配置（当前按天分文件，手动 `find -mtime +N -delete` 即可）
 - 全表扫描拦截类护栏（MongoDB 官方 MCP `indexCheck` 思路；对 OLTP 小库误伤率高，需白名单化后再评估）
 
+## [1.1.1] - 2026-09-11
+
+### Fixed（packages/db）
+
+- **MySQL**：事务控制等语句（`START TRANSACTION`/`BEGIN`/`COMMIT`/`ROLLBACK`）在 mysql2 prepared 协议下报 `ER_UNSUPPORTED_PS`，现自动降级 `query()` 执行（插件从不绑定参数，语义等价）
+- **扫描建连**：识别 baomidou dynamic-datasource 布局（`spring.datasource.dynamic.datasource.<name>.url/username/password`），每个具名数据源独立成候选
+- **扫描建连**：walker 不再被大仓库普通文件挤爆——配置类文件（yml/yaml/properties/.env）单独收集、遍历始终走完整棵树（此前 2000 文件配额被 src 源码灌满后，后遍历目录里的配置文件永远收不到）
+- **达梦**：`parseUrl` 支持 `jdbc:dm://host:port?schema=x`（无路径段）形态，库名回退取 `schema=` 参数；无路径也无 schema 时 database 可选
+- **达梦**：`listTables`/`describeTable` 列名全部加表前缀，修复 DM 报 `[-2112] 有歧义的列名`；`describeTable` 支持限 schema，缺省用连接 schema 限定 OWNER，消除同名表跨 schema 列重复
+- **达梦**：`doConnect` 传 `loginEncrypt: false`，修复 Node≥17（OpenSSL 3）登录报 `digital envelope routines::unsupported`（服务端强制加密时请以 `NODE_OPTIONS=--openssl-legacy-provider` 启动宿主，错误信息已带指引）
+- **Redis**：`sendCommand` 返回的 Buffer 统一递归解码为 UTF-8（此前 INFO/SCAN/GET/TYPE 按字节逐行渲染）；读白名单补充 `PING`/`TIME`/`ECHO`/`LOLWUT`/`LASTSAVE`（不再误判为写）
+- **Elasticsearch**：写端点早期明确拒绝（原先可写模式放行到用户确认后才报"仅执行读查询"）；aggs-only 等纯检索体（`aggs`/`size`/`sort` 等无 `query` 键）按读分类，不再误判为写
+- **MongoDB**：`count`/`insert` 等单文档响应剥掉协议噪声字段 `ok:1`，少一列无信息量输出
+- **Elasticsearch**：兼容 ES 7.0~7.13——v8/v9 客户端的产品校验（`X-elastic-product` 头，7.14+ 才有）会拒绝低版本实例并抛 "unknown product"，现探测失败自动回退 v7 客户端；v7 响应 `{body,...}` 包裹形状统一解包（此前 v7 分支即使连上也只会返回空结果）
+
 ## [1.1.0] - 2026-09-10
 
 ### Added（packages/db）

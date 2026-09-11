@@ -30,4 +30,10 @@ describe("redis isAllowed", () => {
     assert.equal(redisDialect.isAllowed("CONFIG GET maxmemory", false).ok, false);
     assert.equal(redisDialect.isAllowed("SHUTDOWN", false).ok, false);
   });
+  it("classifies PING/TIME as read even in writable mode（不再误判为写）", () => {
+    const ping = redisDialect.isAllowed("PING", false);
+    assert.equal(ping.ok, true);
+    assert.equal(ping.isWrite, false);
+    assert.equal(redisDialect.isAllowed("TIME", false).isWrite, false);
+  });
 });

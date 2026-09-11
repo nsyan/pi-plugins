@@ -37,6 +37,7 @@ const READ_CMDS = [
   "LRANGE", "LLEN", "LINDEX", "SMEMBERS", "SCARD", "SISMEMBER",
   "ZRANGE", "ZSCORE", "ZCARD", "SCAN", "TYPE", "TTL", "PTTL", "EXISTS",
   "STRLEN", "GETRANGE", "INFO", "DBSIZE", "RANDOMKEY", "OBJECT", "MEMORY",
+  "PING", "TIME", "ECHO", "LOLWUT", "LASTSAVE",
 ];
 
 // ── 恒拒命令（与只读开关无关；CONFIG 一刀切含 CONFIG GET，有意从紧）───
@@ -109,7 +110,19 @@ export abstract class KvDialect implements Dialect {
 }
 
 // ── 命令结果转行（展示层统一转字符串，保持原类型）───
+// ioredis sendCommand 对字符串响应可能返回 Buffer，先递归解码为 UTF-8
+// （否则 INFO/SCAN/GET 等会按字节逐行渲染成乱码数字）
+function decodeValue(v: unknown): unknown {
+  if (Buffer.isBuffer(v)) return v.toString("utf8");
+  if (Array.isArray(v)) return v.map(decodeValue);
+  if (v !== null && typeof v === "object") {
+    return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, decodeValue(x)]));
+  }
+  return v;
+}
+
 function toRows(cmd: string, raw: unknown): unknown[][] {
+  raw = decodeValue(raw);
   if (raw === null || raw === undefined) return [];
   if (Array.isArray(raw)) {
     // 偶数长度数组（HGETALL 等）按 k/v 配对展示

@@ -224,6 +224,13 @@ class MongoDialect extends DocumentDialect {
     const r = raw as RawCommandResult;
     if (r?.cursor?.firstBatch !== undefined) return r.cursor.firstBatch;
     if (Array.isArray(r?.values)) return r.values.map((v) => ({ value: v })); // distinct
+    // 单文档响应（count/insert 等）：剥掉协议噪声字段 ok:1，避免多一列无信息量输出
+    // （仅剩 ok 一键时保留，避免空列）
+    if (r !== null && typeof r === "object" && "ok" in r && Object.keys(r).length > 1) {
+      const clone = { ...(r as Record<string, unknown>) };
+      delete clone.ok;
+      return [clone];
+    }
     return [raw]; // count/collStats/写结果等单文档响应
   }
 

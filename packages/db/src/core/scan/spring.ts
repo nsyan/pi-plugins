@@ -67,7 +67,23 @@ export function springKeysToRaw(dotted: Record<string, string>, file: string, we
     (raw as Record<string, unknown>)[field] = v;
     groups.set(g, raw);
   }
-  return [...groups.values()];
+  // baomidou dynamic-datasource（多数据源）：spring.datasource.dynamic.datasource.<name>.<field>
+  // 每个 <name> 独立成候选（与 Spec 单组 datasource 键互不覆盖）
+  const dynamic = new Map<string, RawDbConfig>();
+  const DYNAMIC_PREFIX = "spring.datasource.dynamic.datasource.";
+  for (const [key, value] of Object.entries(dotted)) {
+    if (!key.startsWith(DYNAMIC_PREFIX) || value === "") continue;
+    const rest = key.slice(DYNAMIC_PREFIX.length); // "<name>.<field>"
+    const dot = rest.indexOf(".");
+    if (dot <= 0) continue;
+    const name = rest.slice(0, dot);
+    const field = rest.slice(dot + 1);
+    if (field !== "url" && field !== "jdbc-url" && field !== "username" && field !== "password") continue;
+    const raw = dynamic.get(name) ?? { group: "datasource" as const, profile: profileOf(basename(file)), file, weight };
+    (raw as Record<string, unknown>)[field === "jdbc-url" ? "url" : field] = value;
+    dynamic.set(name, raw);
+  }
+  return [...groups.values(), ...dynamic.values()];
 }
 
 function basename(p: string): string {
