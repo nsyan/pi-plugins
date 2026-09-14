@@ -2,6 +2,32 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.2] - 2026-09-14
+
+### Fixed（packages/db）
+
+- **扫描越界红线可用仓库内软链绕过**：`resolveRoot` 曾只比对「扫描根的 realpath 与其子项」，扫描根本身是软链时自我授权——`dbconf -> /etc` 配合 `path="dbconf"` 会把子树外目录整棵树列给模型（实测返回 `secret-application.yml`、`deep/.env`）。现加第二道闸：`anchor` 与目标都取 realpath 再比对真实子树（字面路径合法 ≠ 真实位置合法），项目本身位于软链路径下（如 macOS `/tmp → /private/tmp`）仍正常放行
+- **文件树随文件系统而变（同一项目不同结果）**：`walk` 曾用全局 realpath 去重目录，真目录与软链别名按 readdir 顺序互相吞掉（APFS 插入序 / ext4 哈希序不同），回归用例因此是顺序相关的假通过。现改为「祖先链 realpath 断环 + 目录项排序」：别名与真目录两条路径都保留，同一目录重复扫描输出一致
+- **`depthCapped` 误报**：置位发生在 realpath/断环检查之前，超深处的软链别名（或空目录）也会报「文件树可能不完整」；现移到检查之后，并同时覆盖目录访问预算（新增 `MAX_DIRS`）
+- **`ctx.cwd` 缺失时静默回落 `process.cwd()`（fail-open）**：等于把红线重新钉在宿主进程目录上，正是本版修掉的错锚点。`scan_project_configs` 现 fail-closed 并说明原因；审计的 `project` 字段回落值改为 `(会话目录未知)`，不再记录错误项目
+- **扫描建连在 pi-web/RPC 下锚错目录（红线失效，双向）**：`resolveRoot` 用 `process.cwd()` 当信任锚，而扩展与 pi 同进程——pi-web 下宿主 cwd 是 `@agegr/pi-web` 包目录、TUI 下是 pi 启动目录，都与会话 cwd（存在 session header，`/resume` 后可变）不同源。后果三态：传绝对路径 → 项目路径全被判越界（`scan path out of scope`）；传 `path="."` → **静默扫描宿主 cwd（pi-web 包目录）并把它的文件树当项目返回给模型**；宿主 cwd 恰为用户目录时 → 反而放行不相干的目录树。现 `resolveRoot(input, anchor)` / `collectTree(rootInput, anchor)` 显式接收锚点，`scan_project_configs` 取 `ctx.cwd`（此前连 `ctx` 形参都没接）
+- **越界报错不可诊断**：`scan path out of scope: X` 不含允许根目录，调用方（模型）无法自我纠正；现补 `（允许根目录: Y）`
+- **`..` 前缀假阳性误杀**：`rel.startsWith("..")` 会把会话目录内合法的 `..foo/`、`..hidden` 判为越界；改为 `rel === ".." || rel.startsWith(".." + sep)`
+- **写操作审计记错项目**：`project` 字段取 `process.cwd()`，与扫描同一个错误锚点，跨项目区分失真；改用 `ctx.cwd`
+
+### Added（packages/db）
+
+- **候选「来源可信度」评级**（新增 `src/core/scan/trust.ts`，确定性规则 + 单测）：`db_scan_save` 原先唯一的客观闸门是 `testConnection`，而「能连通」只证明库存在、凭据有效，**不证明它属于当前环境**——同仓库并存 dev/test/devops/prod/dm 多套配置 + 签入的配置中心副本会漂移，模型很容易提取到废弃库名或别的环境地址，而且照样能测通。现按 `source` 评级并在确认框/候选清单/工具返回里显式展示：🟢 source 含**远端检索证据**（URL / `dataId=` / 显式「远端」）/ 🟡 本地文件带环境标识（附「请核对生效 profile，Maven `@xxx@` 占位符真值在 `pom.xml` 的 `<profile><properties>` 里」）或**仅自述配置中心产品名**（仓库里签入的副本会命中产品名，恰恰是会漂移的那个，不再升级为可信）/ 🔴 无环境标识或本批次跨多个环境（含环境冲突清单）；检出 prod/release 时附「保存后建议标记 prod 启用强制只读」。评级不改变 `status`、不拒绝候选——把环境判断交回用户。**边界已在模块注释与文档中明说**：输入是模型自述的 `source` 文本而非独立取证，它只提高「误连环境」的被发现概率，闸门仍是 `testConnection` + 用户确认
+
+### Changed（packages/db）
+
+- **walk() 三处静默行为改为「不猜、如实上报」**：① 不再跳过 `.` 开头的目录——`.config/db.yml` 这类配置此前永远扫不到，改为靠 `IGNORED_DIRS` 排噪（并把 `docs` 从忽略表移出：本模块不对「目录名是否与配置有关」做猜测，漏扫代价大于多扫）；② 软链不再静默忽略：目标 realpath 在 root 子树内则按真实类型跟随（子树外的忽略——扫描不能成为越界的第二个入口），断环用「祖先链 realpath」（别名与真目录两条路径都保留；全局去重会按 readdir 顺序吞掉一个），目录项排序保证输出确定，软链文件名与目标名任一像配置即归入配置段；③ `MAX_DEPTH` 8 → 16（实测本类工程可达 14 层：`.../service/mapper/impl`），超限通过新增的 `TreeResult.depthCapped` 如实上报（工具输出附“可把更深的子目录作为 path 再扫”，层数取同一个常量、不再硬编码；该标志同时覆盖目录预算 `MAX_DIRS`），不再静默漏扫
+
+- **扫描流程约束从返回文本搬到系统提示**：原先「配置指向配置中心（nacos/apollo）时必须拉远端、远端优先」只写在 `scan_project_configs` 的**成功返回文本**里——工具一失败（catch 只回一行 `扫描失败: …`）整条指引就消失，`description`/`promptSnippet` 也从未提及。现改由 `promptGuidelines` 承载：①先定位生效 profile（Maven `@xxx@` 占位符真值在 `pom.xml` 的 `<profile><properties>`）②配置中心以远端为准（仓库里签入的副本常已过期）③`source` 写清「生效 profile + 来源文件/dataId」④来源可疑先问用户，不直接提交
+- `docs/USAGE.md`：补充「能连通 ≠ 属于当前环境」提示、生效 profile / 配置中心优先级（本地与远端冲突时以远端为准）、来源可信度新规则，以及越界按**真实路径**判定（仓库内指向子树外的软链同样拒绝）；`README.md` 安全模型表补「扫描越界」行
+- `db_scan_save` 结果行回传 trust 理由（此前只回 🟢/🟡/🔴 而 promptGuidelines 又要求模型「如实转述理由」，模型看不到就无从转述）；`SCAN_TRIGGER_HINT` 的「当前工作目录」统一为「会话工作目录（ctx.cwd）」
+- `test/scan-ai.test.ts`：新增锚点 ≠ `process.cwd()`（pi-web 场景）、`..` 前缀回归、软链扫描根逃逸、readdir 顺序无关、软链文件名按目标名识别、不存在路径诊断用例；软链用例改为断言真目录与别名都在清单内（去掉顺序相关的假通过）。测试 155 → 160
+
 ## [1.3.1] - 2026-09-11
 
 ### Fixed（packages/db）

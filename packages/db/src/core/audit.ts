@@ -12,7 +12,7 @@ export const AUDIT_DIR = join(homedir(), ".pi", "agent", "db-audit");
 export interface AuditEntry {
   /** ISO 时间 */
   time: string;
-  /** 执行时的项目路径（process.cwd()），跨项目区分用 */
+  /** 执行时的项目路径（会话 cwd = ctx.cwd），跨项目区分用 */
   project: string;
   /** 连接名 */
   connection: string;

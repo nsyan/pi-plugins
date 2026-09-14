@@ -5,7 +5,9 @@ import { registry } from "./src/dialects/index.js";
 import { decide, effectiveReadonly, writeRequiresReason } from "./src/core/policy.js";
 import { appendAuditLog } from "./src/core/audit.js";
 import { collectTree } from "./src/core/scan/tree.js";
+import { MAX_DEPTH } from "./src/core/scan/walker.js";
 import { validateCandidates } from "./src/core/scan/validate.js";
+import { TRUST_GLYPH, TRUST_LABEL } from "./src/core/scan/trust.js";
 import type { Candidate, ConnConfig, DbTypeId } from "./src/core/types.js";
 import {
   loadConfigs, saveConfigs, loadPluginConfig, savePluginConfig, getConfigSummary,
@@ -78,7 +80,7 @@ function familyHint(c: ConnConfig): string {
 const SCAN_TRIGGER_HINT = [
   "[项目扫描建连]",
   "当用户说“连一下这个项目的数据库”“帮我把这项目的库配上”“/db scan”等时，走两步 AI 扫描流程：",
-  "第 1 步：调用 scan_project_configs 获取项目文件树（path 必须在当前工作目录子树内，越界拒绝）；",
+  "第 1 步：调用 scan_project_configs 获取项目文件树（path 相对会话工作目录 ctx.cwd 解析，按真实路径判定越界，越界拒绝）；",
   "第 2 步：从树中自行判断哪些文件可能包含数据库连接配置（任意语言：Spring/Py/Go/TS/Rust 的 yml/toml/env/ini/json 等都算），用自带读文件工具阅读它们，",
   "  从中提取连接候选（类型/host/端口/库名/账号/密码），用户说“只要 pg”这类话时只提取对应类型；",
   "第 3 步：调用 db_scan_save 提交候选——工具会弹确认框，用户逐个确认并补录密码后才写盘，绝不静默建连。",
@@ -134,7 +136,16 @@ const SCAN_GLYPH: Record<Candidate["status"], string> = {
 function candidateLine(c: Candidate): string {
   const p = c.partial;
   const miss = c.missing.length ? `，缺: ${c.missing.join("/")}` : "";
-  return `${SCAN_GLYPH[c.status]} [${c.status}] ${p.name} (${c.dialectId}) ${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}${miss} <- ${c.source}`;
+  const trust = `${TRUST_GLYPH[c.trust.level]}${TRUST_LABEL[c.trust.level]}(环境: ${c.trust.env ?? "未知"})`;
+  return `${SCAN_GLYPH[c.status]} [${c.status}] ${p.name} (${c.dialectId}) ${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}${miss} ${trust} <- ${c.source}`;
+}
+
+/** 会话工作目录（信任锚）——扫描与审计都用它，不用 `process.cwd()`。
+ *  `process.cwd()` 是宿主进程的 OS cwd，pi-web 下是 pi-web 包目录、TUI 下是启动目录，
+ *  都与会话 cwd 不同源（见 walker.resolveRoot 注释）。缺失时返回 null，由调用方 fail-closed。 */
+function sessionCwdOf(ctx: any): string | null {
+  const cwd = ctx?.cwd;
+  return typeof cwd === "string" && cwd ? cwd : null;
 }
 
 // ── 导出扩展 ──────────────────────────────────────
@@ -148,9 +159,12 @@ export default function (pi: ExtensionAPI) {
   const confirmAndSaveCandidate = async (ctx: any, cand: Candidate): Promise<"saved" | "skipped" | "failed"> => {
     const p = cand.partial;
     let name = p.name!;
+    // 来源可信度必须出现在确认框里：testConnection 通过之后，唯一能拦住「连错环境」的就是用户这一眼
+    const trustBlock = `\n${TRUST_GLYPH[cand.trust.level]} ${TRUST_LABEL[cand.trust.level]}（环境: ${cand.trust.env ?? "未知"}）\n`
+      + cand.trust.reasons.map((r) => `  · ${r}`).join("\n");
     const ok = await ctx.ui.confirm(
       "AI 扫描建连",
-      `添加 ${name} (${cand.dialectId})？\n${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}\n来源: ${cand.source}`,
+      `添加 ${name} (${cand.dialectId})？\n${p.host ?? ""}:${p.port ?? ""}${p.database ? "/" + p.database : ""}\n来源: ${cand.source}${trustBlock}`,
     );
     if (!ok) return "skipped";
 
@@ -815,7 +829,7 @@ export default function (pi: ExtensionAPI) {
       if (verdict.isWrite && cfg.audit_enabled) {
         appendAuditLog({
           time: new Date().toISOString(),
-          project: process.cwd(),
+          project: sessionCwdOf(ctx) ?? "(会话目录未知)",
           connection: config.name,
           type: config.type,
           summary: verdict.summary ?? "",
@@ -959,24 +973,38 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "scan_project_configs",
     label: "扫描项目数据库配置",
-    description: "获取项目文件树，供 AI 自行定位并阅读数据库连接配置文件（任意语言：Spring/Py/Go/TS/Rust 的 yml/toml/env/ini/json 等均覆盖）。本身不做提取；提取结果用 db_scan_save 提交。",
-    promptSnippet: "当用户说「连一下这个项目的数据库」「帮我把这项目的库配上」「/db scan 配置pg」等时调用第 1 步。返回项目文件树后：自己判断哪些文件可能含数据库连接配置（用户指了类型就只找该类型），用自带读文件工具阅读，提取连接候选（类型/host/端口/库名/账号/密码），然后调用 db_scan_save 提交。path 必须在当前工作目录子树内。",
+    description: "获取项目文件树，供 AI 自行定位并阅读数据库连接配置文件（任意语言：Spring/Py/Go/TS/Rust 的 yml/toml/env/ini/json 等均覆盖）。本身不做提取；提取结果用 db_scan_save 提交。path 相对会话工作目录（ctx.cwd）解析，按真实路径（realpath）强制限定在该子树内。",
+    promptSnippet: "当用户说「连一下这个项目的数据库」「帮我把这项目的库配上」「/db scan 配置pg」等时调用第 1 步。返回项目文件树后：自己判断哪些文件可能含数据库连接配置（用户指了类型就只找该类型），用自带读文件工具阅读，提取连接候选（类型/host/端口/库名/账号/密码），然后调用 db_scan_save 提交。path 相对会话工作目录解析，必须在会话工作目录子树内。",
+    promptGuidelines: [
+      "扫描建连（scan_project_configs → db_scan_save）先定位「当前生效的环境」再取配置：Spring 项目读 application.yml/bootstrap.yml 与 pom.xml 的 profiles（Maven 的 @xxx@ 占位符真值在 pom.xml 的 <profile><properties> 里）；同仓库常并存 dev/test/devops/prod/dm 多套配置，读错 profile 会拿到废弃库。",
+      "配置指向配置中心（nacos/apollo/spring-cloud-config）时以远端为准：仓库里签入的 *_配置副本.yaml 常已过期，远端与本地冲突时用远端值；每个候选的 source 写清「生效 profile + 来源文件/dataId」。",
+      "能连通只证明库存在且凭据有效，不等于它属于当前环境：来源可疑（非生效 profile、环境无法确定）的候选不要提交，先向用户确认。插件按确定性规则给每个候选评级并随工具返回（🟢 source 含远端证据 URL/dataId、🟡 本地文件带环境标识或仅自述配置中心、🔴 无环境标识或本批跨环境冲突），汇报结果时必须如实转述评级与理由，不得把 🟡/🔴 说成已核实；从远端拉的候选请在 source 里写明 dataId 或 URL。",
+    ],
     parameters: Type.Object({
-      path: Type.Optional(Type.String({ description: "扫描根目录，缺省为当前工作目录；强制限定在当前工作目录子树内，越界拒绝" })),
+      path: Type.Optional(Type.String({ description: "扫描根目录，缺省为会话工作目录；强制限定在会话工作目录子树内（按真实路径判定，指向子树外的软链同样被拒，越界拒绝）" })),
     }),
-    async execute(_toolCallId: string, params: { path?: string }, _signal: any) {
+    async execute(_toolCallId: string, params: { path?: string }, _signal: any, _onUpdate?: any, ctx?: any) {
+      // 锚点取会话 cwd（ctx.cwd）。缺失时 **fail-closed**：用 process.cwd() 兜底等于把红线
+      // 钉在宿主目录上（pi-web 下就是 pi-web 包目录），正是本版修掉的错锚点
+      const anchor = sessionCwdOf(ctx);
+      if (!anchor) {
+        return { details: undefined,
+          content: [{ type: "text" as const, text: "扫描失败: 无法获取会话工作目录（ctx.cwd 缺失）——拒绝在未知锚点下扫描。" }],
+        };
+      }
       try {
-        const tree = collectTree(params.path ?? ".");
+        const tree = collectTree(params.path ?? ".", anchor);
         const text = [
           `项目根目录: ${tree.root}（文件总数 ${tree.total}${tree.truncated ? "，已截断展示前 " + tree.lines.length + " 条" : ""}）`,
+          ...(tree.depthCapped ? [`⚠️ 文件树可能不完整：有目录未展开（超过 ${MAX_DEPTH} 层或目录数上限）——可把更深的子目录作为 path 再扫一次`] : []),
           "",
           "文件树（相对路径，浅层优先）：",
           ...tree.lines,
           "",
           "下一步（必须执行）：",
-          "1. 从文件树中判断哪些文件可能包含数据库连接配置——任意语言/格式都算：Spring application*.yml、Python settings/config.py、Go config.yaml、Node .env、Rust .env+config.toml、docker-compose、K8s manifest 等；",
-          "2. 用你的读文件工具阅读这些文件；若发现 bootstrap.yml/application.yml 指向配置中心（nacos/apollo/spring-cloud-config），用配置中心地址与凭据拉取远端配置后再提取——例如 Nacos：先用 POST {server}/nacos/v1/auth/login（form: username/password）拿 accessToken，再 GET {server}/nacos/v1/cs/configs?dataId=<服务名>.yaml&group=<group>&tenant=<namespace-id>&accessToken=<token>，返回的 YAML 原文同样提取候选；",
-          "3. 从本地/远端配置中提取连接候选：dialectId（postgresql/mysql/oracle/dm/redis/elasticsearch/mongodb/neo4j/hive/spark）、host、port、database、username、password、url（如有完整连接串）、source（来源文件或 dataId）；用户指定了类型（如「配置pg」）就只提取该类型；",
+          "1. 先定位「当前生效的环境」，再看文件：Spring 项目看 application.yml/bootstrap.yml 与 pom.xml 的 profiles（Maven 的 @xxx@ 占位符真值在 pom.xml 的 <profile><properties> 里），确定生效 profile（如 devops）与生效配置文件（如 application-devops.yml）——同仓库常并存 dev/test/devops/prod/dm 多套配置，读错 profile 会拿到废弃库；再判断哪些文件可能包含数据库连接配置——任意语言/格式都算：Spring application*.yml、Python settings/config.py、Go config.yaml、Node .env、Rust .env+config.toml、docker-compose、K8s manifest 等；",
+          "2. 用你的读文件工具阅读生效 profile 的文件；若 bootstrap.yml/application.yml 指向配置中心（nacos/apollo/spring-cloud-config），必须以远端配置为准（仓库里签入的副本常已过期）——例如 Nacos：先用 POST {server}/nacos/v1/auth/login（form: username/password）拿 accessToken，再 GET {server}/nacos/v1/cs/configs?dataId=<服务名>.yaml&group=<group>&tenant=<namespace-id>&accessToken=<token>；远端与本地冲突时以远端为准；",
+          "3. 从生效配置中提取连接候选：dialectId（postgresql/mysql/oracle/dm/redis/elasticsearch/mongodb/neo4j/hive/spark）、host、port、database、username、password、url（如有完整连接串）、source（写清「生效 profile + 来源文件/dataId」，如 pom.xml#devops → application-devops.yml）；用户指定了类型（如「配置pg」）就只提取该类型；来源可疑（非生效 profile、环境无法确定）的候选不要提交，先向用户确认；",
           "4. 调用 db_scan_save 提交候选数组。带 url 的候选必须能被对应方言解析，编造的 url 会被拒绝；",
           "5. 工具会弹确认框让用户逐个确认并补录密码，把工具返回的保存结果汇报给用户。",
         ].join("\n");
@@ -1005,7 +1033,7 @@ export default function (pi: ExtensionAPI) {
         password: Type.Optional(Type.String({ description: "密码（缺失时确认框会引导用户补录）" })),
         url: Type.Optional(Type.String({ description: "完整连接串（可选，提供时必须能被方言解析，否则整条拒绝）" })),
         name: Type.Optional(Type.String({ description: "连接名称（缺省自动生成）" })),
-        source: Type.Optional(Type.String({ description: "来源描述，如配置文件相对路径" })),
+        source: Type.Optional(Type.String({ description: "来源描述。本地文件写「生效 profile + 来源文件」，如 pom.xml#devops → application-devops.yml；从配置中心拉的必须写远端证据（远端 URL 或 dataId=），否则只能评为 🟡。插件按此评级并在确认框展示，缺失/无环境标识评为 🔴" })),
       }), { description: "连接候选数组" }),
     }),
     async execute(_toolCallId: string, params: { candidates: unknown[] }, _signal: any, _onUpdate?: any, ctx?: any) {
@@ -1027,7 +1055,10 @@ export default function (pi: ExtensionAPI) {
       for (const cand of candidates) {
         try {
           const r = await confirmAndSaveCandidate(ctx, cand);
-          results.push(`${SCAN_GLYPH[cand.status]} ${cand.partial.name} (${cand.dialectId}): ${r === "saved" ? "已保存" : r === "skipped" ? "用户跳过" : "连接失败未保存"}`);
+          const trustLine = `${TRUST_GLYPH[cand.trust.level]}${TRUST_LABEL[cand.trust.level]}（环境: ${cand.trust.env ?? "未知"}）`;
+          // 理由一并回传：promptGuidelines 要求模型如实转述评级与理由，模型看不到就无从转述
+          const why = cand.trust.reasons.length ? `\n      ${cand.trust.reasons.join("；")}` : "";
+          results.push(`${SCAN_GLYPH[cand.status]} ${cand.partial.name} (${cand.dialectId}): ${r === "saved" ? "已保存" : r === "skipped" ? "用户跳过" : "连接失败未保存"} ${trustLine}${why}`);
         } catch (err) {
           results.push(`❌ ${cand.partial.name} (${cand.dialectId}): 异常 ${err instanceof Error ? err.message : String(err)}`);
         }

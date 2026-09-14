@@ -6,6 +6,7 @@
 
 import { basename } from "node:path";
 import { registry } from "../../dialects/index.js";
+import { assessSourceTrust } from "./trust.js";
 import type { Candidate, CandidateInput, CandidateStatus, ConnConfig, DbTypeId } from "../types.js";
 
 /** 各类型建连必需字段（空串同样视为缺失）——家族语义，非正则，保留 */
@@ -37,6 +38,13 @@ export function validateCandidates(raw: unknown, existingNames: Set<string>): Va
   const candidates: Candidate[] = [];
   const rejected: string[] = [];
   const seenNames = new Set(existingNames);
+  // 来源可信度：跨候选的环境冲突要看整批，故先批量评估，再按原始下标挂到候选上
+  const trusts = assessSourceTrust(
+    list.map((item) =>
+      item && typeof item === "object" && nonEmpty((item as Record<string, unknown>).source)
+        ? String((item as Record<string, unknown>).source)
+        : ""),
+  );
 
   for (const [i, item] of list.entries()) {
     if (item === null || typeof item !== "object") {
@@ -106,7 +114,8 @@ export function validateCandidates(raw: unknown, existingNames: Set<string>): Va
       dialectId: dialect.id,
       partial: { name, ...bag } as Partial<import("../types.js").ConnConfig>,
       missing,
-      source: nonEmpty(c.source) ? String(c.source) : "AI 提取",
+      source: nonEmpty(c.source) ? String(c.source) : "AI 提取（未提供来源）",
+      trust: trusts[i],
       warnings: Array.isArray(c.warnings) ? c.warnings.map(String).slice(0, 3) : undefined,
     });
   }

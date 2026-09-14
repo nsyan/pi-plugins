@@ -1,4 +1,5 @@
 // core/types.ts
+import type { SourceTrust } from "./scan/trust.js";
 export type DbTypeId = "postgresql" | "mysql" | "oracle" | "dm"
   | "redis" | "elasticsearch" | "mongodb" | "hive" | "spark" | "neo4j";
 export type DbFamily = "relational" | "kv" | "search" | "document" | "bigdata" | "graph";
@@ -58,6 +59,8 @@ export interface Candidate {
   partial: Partial<ConnConfig>;     // 归一化后的字段（含默认 name）
   missing: string[];                // 待补字段名（incomplete 时）
   source: string;                   // 来源描述
+  /** 来源可信度（插件按确定性规则从模型自述的 source 评估，供展示，不影响 status；不是独立取证） */
+  trust: SourceTrust;
   warnings?: string[];
 }
 
