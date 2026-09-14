@@ -2,6 +2,16 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.3] - 2026-09-14
+
+### Changed（packages/db）
+
+- **发布元数据优化（可检索性/可发现性）**：description 精简至 npm 255 字符上限内——此前 348 字符被 npm 截断，尾部英文数据库清单（PostgreSQL/MySQL/…/Spark）整段丢失，npm 搜索与 pi.dev 目录站内搜索都命不中；现在十种数据库清单、pi coding agent、扫描建连等核心检索词完整保留在截断线内
+- **keywords 补全检索词**：新增 pi / pi-coding-agent / agent / ai-agent / jdbc——pi.dev 目录的站内搜索串由包名+描述+作者+关键词拼接而成，npm 搜索同权重计入
+- **发布包附 LICENSE**：packages/db 增加 LICENSE 并加入 files，发布 tarball 此前无许可证文本（仅 license: MIT 字段）
+- **补 engines.node >= 18**：与仓库根一致，不兼容环境安装时 npm 能提前告警
+- 版本号 1.3.3
+
 ## [1.3.2] - 2026-09-14
 
 ### Fixed（packages/db）

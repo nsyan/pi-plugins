@@ -16,7 +16,13 @@
 
 ## 🚀 安装
 
-使用 pi 命令直接安装某个插件：
+使用 pi 命令从 npm 安装（推荐）：
+
+```bash
+pi install npm:@nsyan/db     # db —— AI 数据库接入
+```
+
+仓库开发者走本地路径：
 
 ```bash
 pi install ./packages/db
@@ -49,7 +55,7 @@ pnpm test             # 运行全部包的测试
 
 ## 📜 更新记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **1.3.2**（2026-09-14）：修掉扫描越界的软链绕过与文件树顺序不确定，扫描/审计统一以 `ctx.cwd` 为信任锚；新增候选来源可信度评级（测试 160 全绿）。
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **1.3.3**（2026-09-14）：发布元数据优化——description 压入 npm 255 字符上限、补全检索关键词、发布包附 LICENSE 与 engines 声明。
 
 ## 📄 许可
 
