@@ -2,6 +2,21 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.4.0] - 2026-09-23
+
+### Added（packages/db）
+
+- **确认弹窗 SQL 格式化 + 语法高亮 + 标签排版**：写操作确认框此前把 AI 生成的单行 SQL 原样贴出（如 `UPDATE users SET a=1,b=2 WHERE c=3`），而且 pi web 的 Markdown 会把单换行折叠成空格，长语句几乎不可读。现新增 `src/core/sql-format.ts` + `src/ui/sql-confirm.ts`（展示层纯函数，含单测）：
+  - **格式化**（`formatSql`）：按子句换行（SELECT/FROM/WHERE/SET/VALUES/JOIN/…）、逗号拆列、`AND`/`OR`/`ON` 缩进、子查询收尾括号单独成行、多语句留空行，关键字统一大写；**长括号组**（`CREATE TABLE(...)` 列定义、长 `IN(...)` 列表）按显示宽度自动拆成块状列表（CJK 按 2 列计宽），短括号组（`count(*)`、`IN (1,2,3)`）保持内联；字符串字面量、注释与标识符原样保留
+  - **语法高亮**：方言映射到高亮语言（关系型/大数据/图 → `sql`，MongoDB/Elasticsearch → `json`，Redis 无同类语法走代码块配色）
+  - **标签排版**：确认框正文改为 Markdown——`> **📝 执行理由**：…`（引用块）+ `- **📋 影响摘要**：\`…\``、`- **🗄️ 数据库**：\`…\``（列表 + 行内代码）+ 带方言标记的 SQL 代码块；颜色靠主题对 引用/加粗/行内代码/代码块 的默认着色（Markdown 无法任意指定颜色，pi-web 的 rehype-sanitize 会剥内联样式）
+  - **双端同源渲染**：TUI 走 `ctx.ui.custom` 自定义弹窗（pi-tui `Markdown` → `highlightCode`，Enter 执行 / Esc 取消）；**RPC/pi web 走同一份 Markdown**——已核对 pi-web 0.9.x 前端：确认弹窗正文用 react-markdown 渲染，代码围栏走 Prism（`react-syntax-highlighter`，已注册 `sql`/`json`），所以 **pi web 里同样高亮**，并自带语言标签、行号、复制按钮与正文原生滚动。`ctx.ui.confirm` 本身是 SelectList（纯文本、无法高亮），故 TUI 必须走 custom；UI 异常时回退 confirm（仍发同一份 Markdown），确认环节绝不被静默跳过
+  - **围栏安全**：SQL 内含反引号时自动加长围栏（≥ 内容最长反引号串 + 1），避免撑破代码块
+  - **红线**：美化只作用于「看到什么」，实际执行始终是原始 `params.sql`（美化失败时原样回退）
+  - 已知边界：RPC 的 `confirm` 请求只有 `title`/`message`/`timeout`，**弹窗尺寸由 pi-web 写死**（560×760），插件层改不了；内容过长靠正文滚动。另：全局安装的旧版 pi-web 0.8.9 的确认弹窗不走 Markdown，不会高亮（建议固定 0.9.x）
+  - 新增 `@earendil-works/pi-tui` peer 依赖（TUI 组件来源）；测试 160 → 187
+- 版本号 1.4.0
+
 ## [1.3.3] - 2026-09-14
 
 ### Changed（packages/db）

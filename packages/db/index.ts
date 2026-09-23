@@ -16,6 +16,7 @@ import {
   recordLastUsed, recordTestResult, connSummaryLine, envTagLabel, formatRelativeTime,
 } from "./src/config.js";
 import type { PluginConfig } from "./src/config.js";
+import { confirmSqlExecution } from "./src/ui/sql-confirm.js";
 
 // ── URL 解析：遍历 registry 各方言 parseUrl，首个非 null 胜出 ────
 // 关系型 JDBC + 原生 URI 双形态由各方言 parseUrl 兼收（Spec §7）
@@ -530,10 +531,11 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       if (action === "confirm") {
-        const ok = await ctx.ui.confirm(
-          "SQL 执行确认",
-          `${verdict.summary ?? ""}\n\nSQL:\n${sql}`
-        );
+        const ok = await confirmSqlExecution(ctx, {
+          summary: verdict.summary,
+          sql,
+          type: config.type,
+        });
         if (!ok) continue;
       }
       ctx.ui.notify("正在执行查询...", "info");
@@ -800,10 +802,13 @@ export default function (pi: ExtensionAPI) {
             content: [{ type: "text" as const, text: "当前环境无法弹出确认对话框，已取消 SQL 执行。请在有界面的环境中操作。" }],
           };
         }
-        const ok = await ctx.ui.confirm(
-          "SQL 执行确认",
-          `理由: ${params.reason}\n\n${verdict.summary ?? ""}\n\n数据库: ${config.name}\n\nSQL:\n${params.sql}`,
-        );
+        const ok = await confirmSqlExecution(ctx, {
+          reason: params.reason,
+          summary: verdict.summary,
+          database: config.name,
+          sql: params.sql,
+          type: config.type,
+        });
         if (!ok) {
           return { details: undefined,
             content: [{ type: "text" as const, text: "用户取消了 SQL 执行。" }],
