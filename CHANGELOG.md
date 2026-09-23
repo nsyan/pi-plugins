@@ -2,7 +2,7 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [1.4.0] - 2026-09-23
+## [1.3.4] - 2026-09-23
 
 ### Added（packages/db）
 
@@ -15,7 +15,7 @@
   - **红线**：美化只作用于「看到什么」，实际执行始终是原始 `params.sql`（美化失败时原样回退）
   - 已知边界：RPC 的 `confirm` 请求只有 `title`/`message`/`timeout`，**弹窗尺寸由 pi-web 写死**（560×760），插件层改不了；内容过长靠正文滚动。另：全局安装的旧版 pi-web 0.8.9 的确认弹窗不走 Markdown，不会高亮（建议固定 0.9.x）
   - 新增 `@earendil-works/pi-tui` peer 依赖（TUI 组件来源）；测试 160 → 187
-- 版本号 1.4.0
+- 版本号 1.3.4
 
 ## [1.3.3] - 2026-09-14
 
