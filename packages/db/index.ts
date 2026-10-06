@@ -660,18 +660,22 @@ export default function (pi: ExtensionAPI) {
       },
     ];
 
-    // 选择要修改的字段
+    // 选择要修改的字段（尾部动作项：完成修改=保存并返回；返回=放弃未保存修改并返回上一级）
+    const DONE = "✅ 完成修改";
+    const BACK = "← 返回";
     const fieldLabels = fields.map((f) => `${f.label}（当前: ${f.current}）`);
-    fieldLabels.push("✅ 完成修改");
+    fieldLabels.push(DONE, BACK);
 
     const newCfg = { ...cfg };
+    let back = false;
 
     while (true) {
       const pick = await ctx.ui.select("选择要修改的设置项", fieldLabels);
-      if (!pick || pick === "✅ 完成修改") break;
+      if (!pick || pick === DONE) break;
+      if (pick === BACK) { back = true; break; }
 
       const idx = fieldLabels.indexOf(pick);
-      if (idx < 0) break;
+      if (idx < 0 || idx >= fields.length) break;
       const field = fields[idx];
 
       if (field.options) {
@@ -705,9 +709,17 @@ export default function (pi: ExtensionAPI) {
             String(val);
         return `${f.label}（当前: ${display}）`;
       });
-      updatedFields.push("✅ 完成修改");
+      updatedFields.push(DONE, BACK);
       fieldLabels.length = 0;
       fieldLabels.push(...updatedFields);
+    }
+
+    if (back) {
+      // 返回上一级：本次未保存的修改不落盘（确有改动才提示，避免误以为已保存）
+      if (JSON.stringify(newCfg) !== JSON.stringify(cfg)) {
+        ctx.ui.notify("已返回上一级，未保存的修改已放弃", "info");
+      }
+      return;
     }
 
     savePluginConfig(newCfg);
@@ -1107,52 +1119,56 @@ export default function (pi: ExtensionAPI) {
     description: "AI 接入数据库",
     handler: async (args: string, ctx: any) => {
       const sub = args.trim().toLowerCase();
-      const configs = loadConfigs();
+      let configs = loadConfigs();
 
       if (!sub) {
         // 导航菜单：查看 / 编辑 / 新增 / 删除 / 设置
-        const navActions = [
-          "📋 打开连接",
-          "⚡ 切换默认",
-          "✏️ 编辑连接",
-          "➕ 新增连接",
-          "🔎 扫描建连（会话 AI）",
-          "🗑️ 删除连接",
-          "⚙️ 设置",
-        ];
-        const navChoice = await ctx.ui.select("数据库管理", navActions);
-        if (!navChoice) return;
+        // 循环：子流程（含「⚙️ 设置」）执行完回到本菜单，「← 返回」退出
+        while (true) {
+          configs = loadConfigs(); // 每轮重载，新增/删除后菜单与选择器保持最新
+          const navActions = [
+            "📋 打开连接",
+            "⚡ 切换默认",
+            "✏️ 编辑连接",
+            "➕ 新增连接",
+            "🔎 扫描建连（会话 AI）",
+            "🗑️ 删除连接",
+            "⚙️ 设置",
+            "← 返回",
+          ];
+          const navChoice = await ctx.ui.select("数据库管理", navActions);
+          if (!navChoice || navChoice === "← 返回") return;
 
-        if (navChoice === "⚙️ 设置") {
-          await showPluginConfigMenu(ctx);
-        } else if (navChoice === "📋 打开连接") {
-          const config = await selectDbConfig(ctx, configs, "选择连接");
-          if (config) await showDbActions(ctx, config);
-        } else if (navChoice === "⚡ 切换默认") {
-          // v1.1 UX 共识 Q1：两层直达，替代“打开→动作→设为默认”三层路径
-          const configsNow = loadConfigs();
-          if (configsNow.length === 0) {
-            ctx.ui.notify("尚无数据库连接", "info");
-          } else {
-            const target = await selectDbConfig(ctx, configsNow, "设为默认连接（⭐ 为当前默认）");
-            if (target) {
-              if (target.isDefault) {
-                ctx.ui.notify(`已是默认连接: ${target.name}`, "info");
-              } else {
-                saveConfigs(setDefaultConfig(configsNow, target.id));
-                ctx.ui.notify(`默认连接已切换: ${target.name}`, "success");
+          if (navChoice === "⚙️ 设置") {
+            await showPluginConfigMenu(ctx);
+          } else if (navChoice === "📋 打开连接") {
+            const config = await selectDbConfig(ctx, configs, "选择连接");
+            if (config) await showDbActions(ctx, config);
+          } else if (navChoice === "⚡ 切换默认") {
+            // v1.1 UX 共识 Q1：两层直达，替代“打开→动作→设为默认”三层路径
+            if (configs.length === 0) {
+              ctx.ui.notify("尚无数据库连接", "info");
+            } else {
+              const target = await selectDbConfig(ctx, configs, "设为默认连接（⭐ 为当前默认）");
+              if (target) {
+                if (target.isDefault) {
+                  ctx.ui.notify(`已是默认连接: ${target.name}`, "info");
+                } else {
+                  saveConfigs(setDefaultConfig(configs, target.id));
+                  ctx.ui.notify(`默认连接已切换: ${target.name}`, "success");
+                }
               }
             }
+          } else if (navChoice === "✏️ 编辑连接") {
+            const config = await selectDbConfig(ctx, configs, "选择要编辑的连接");
+            if (config) await editDbConfig(ctx, config);
+          } else if (navChoice === "➕ 新增连接") {
+            await addDbConfig(ctx);
+          } else if (navChoice === "🔎 扫描建连（会话 AI）") {
+            ctx.ui.notify("扫描建连已升级为会话 AI 驱动：请在对话框直接说「连一下这个项目的数据库」或「/db scan 配置pg」，\nAI 会读取项目配置文件并提取连接，在会话内弹框确认后建连。", "info");
+          } else if (navChoice === "🗑️ 删除连接") {
+            await deleteDbConfig(ctx, configs);
           }
-        } else if (navChoice === "✏️ 编辑连接") {
-          const config = await selectDbConfig(ctx, configs, "选择要编辑的连接");
-          if (config) await editDbConfig(ctx, config);
-        } else if (navChoice === "➕ 新增连接") {
-          await addDbConfig(ctx);
-        } else if (navChoice === "🔎 扫描建连（会话 AI）") {
-          ctx.ui.notify("扫描建连已升级为会话 AI 驱动：请在对话框直接说「连一下这个项目的数据库」或「/db scan 配置pg」，\nAI 会读取项目配置文件并提取连接，在会话内弹框确认后建连。", "info");
-        } else if (navChoice === "🗑️ 删除连接") {
-          await deleteDbConfig(ctx, configs);
         }
       } else if (sub === "config" || sub === "c") {
         await showPluginConfigMenu(ctx);
