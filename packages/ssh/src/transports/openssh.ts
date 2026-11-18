@@ -4,7 +4,9 @@ import { chmodSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { shellQuote, wrapWithWatchdog } from "../core/guard.js";
+import { StringDecoder } from "node:string_decoder";
 import { clipUtf8, parseRemoteHash, remoteHashCommand, sha256File } from "../core/hash.js";
+import { hostKeyFingerprint } from "../core/known-hosts.js";
 import { TransferMismatchError, UnsupportedError, type HostProfile } from "../core/types.js";
 
 export function controlPath(): string {
@@ -49,15 +51,84 @@ async function ensureControlMaster(profile: HostProfile): Promise<void> {
   masters.add(target);
 }
 
+
+/**
+ * 取远端主机密钥指纹。
+ * openssh 传输本身不解析主机密钥（校验交给系统 ssh 与 known_hosts），但 `ssh_hosts test`
+ * 仍要能报出指纹供人核对——此前这里返回空串，用户在用 openssh 传输时无法对照
+ * `ssh-keygen -lf`。改用 ssh-keyscan 取密钥原文，再算和 ssh2 路径同一个 SHA256。
+ */
+export async function scanHostKeyFingerprint(
+  host: string,
+  port: number,
+  opts?: { timeoutMs?: number },
+): Promise<{ fingerprint: string; keyType: string } | undefined> {
+  const args = ["-T", String(Math.max(1, Math.floor((opts?.timeoutMs ?? 5000) / 1000))), "-p", String(port), "-t", "ed25519,ecdsa,rsa", host];
+  return new Promise((resolve) => {
+    const child = spawn("ssh-keyscan", args, { stdio: ["ignore", "pipe", "pipe"] });
+    const out = collect(child.stdout);
+    const timer = setTimeout(() => child.kill("SIGTERM"), (opts?.timeoutMs ?? 5000) + 2000);
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(undefined);
+    });
+    child.on("close", () => {
+      clearTimeout(timer);
+      out.end();
+      // 输出形如 `host ssh-ed25519 AAAAC3...`；注释行与空行跳过。
+      // 同一台机器可能同时有 ed25519 / ecdsa / rsa 三把密钥，ssh-keyscan 的输出顺序
+      // 不保证。必须按 ssh2 的偏好取 ed25519，否则两条传输报出不同指纹，
+      // 用户拿它跟 `ssh-keygen -lf` 对照就会以为密钥变了。
+      const found: Array<{ keyType: string; fingerprint: string }> = [];
+      for (const line of out.text().split("\n")) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 3 || line.startsWith("#")) continue;
+        const [, keyType, key] = parts;
+        try {
+          found.push({ keyType, fingerprint: hostKeyFingerprint(Buffer.from(key, "base64")) });
+        } catch {
+          // 解不出来就跳过这一行
+        }
+      }
+      const prefer = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"];
+      found.sort((a, b) => {
+        const ia = prefer.indexOf(a.keyType);
+        const ib = prefer.indexOf(b.keyType);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      resolve(found[0]);
+    });
+  });
+}
+
+/**
+ * 把子进程的流收成字符串。
+ * 不能逐块 `chunk.toString("utf8")`：块边界与字符边界无关，中文输出会在每个
+ * 块边界被切成两半、各解出两个替换符。StringDecoder 会保留半个字符到下一块。
+ */
+function collect(stream: NodeJS.ReadableStream): { text: () => string; end: () => void } {
+  const decoder = new StringDecoder("utf8");
+  let value = "";
+  stream.on("data", (chunk: Buffer) => {
+    value += decoder.write(chunk);
+  });
+  return {
+    text: () => value,
+    end: () => {
+      value += decoder.end();
+    },
+  };
+}
+
 function runQuiet(command: string, args: string[]): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+    const err = collect(child.stderr);
+    child.on("error", () => resolve({ code: -1, stderr: err.text() }));
+    child.on("close", (code) => {
+      err.end();
+      resolve({ code, stderr: err.text() });
     });
-    child.on("error", () => resolve({ code: -1, stderr }));
-    child.on("close", (code) => resolve({ code, stderr }));
   });
 }
 
@@ -79,19 +150,15 @@ async function sftpBatch(profile: HostProfile, commands: string[]): Promise<stri
   const args = [...sshOptions(profile), "-P", String(profile.port ?? 22), "-b", "-", `${profile.user}@${profile.host}`];
   return new Promise((resolve, reject) => {
     const child = spawn("sftp", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    const out = collect(child.stdout);
+    const err = collect(child.stderr);
     child.stdin.end(`${commands.join("\n")}\n`);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
     child.on("error", reject);
     child.on("close", (code) => {
-      if (code === 0) resolve(stdout);
-      else reject(new Error(stderr.trim() || `sftp 退出码 ${code}`));
+      out.end();
+      err.end();
+      if (code === 0) resolve(out.text());
+      else reject(new Error(err.text().trim() || `sftp 退出码 ${code}`));
     });
   });
 }
@@ -182,20 +249,22 @@ export function execOpenSsh(profile: HostProfile, request: OpenSshRequest): Prom
     // 通道 EOF 就当作「客户端放弃」立即 kill 命令。stdio 用 "ignore" 时 fd 0 是
     // /dev/null，fd 3 立刻 EOF，命令会被自己的 watcher 秒杀（exit 143 + 空输出）。
     const child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    const out = collect(child.stdout);
+    const err = collect(child.stderr);
     const timer = request.timeoutMs
       ? setTimeout(() => child.kill("SIGTERM"), request.timeoutMs)
       : undefined;
     const abort = () => child.kill("SIGTERM");
     request.signal?.addEventListener("abort", abort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
-      stdout += text;
-      request.onData?.(text);
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+    // 中文输出的块边界续接见 collect()；onData 只在解出完整字符后回调。
+    let pushed = 0;
+    child.stdout.on("data", () => {
+      const text = out.text();
+      if (text.length > pushed) {
+        const delta = text.slice(pushed);
+        pushed = text.length;
+        request.onData?.(delta);
+      }
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -204,7 +273,11 @@ export function execOpenSsh(profile: HostProfile, request: OpenSshRequest): Prom
     child.on("close", (code) => {
       clearTimeout(timer);
       request.signal?.removeEventListener("abort", abort);
-      resolve({ stdout, stderr: stripSshNoise(stderr), exitCode: code, durationMs: Date.now() - started });
+      out.end();
+      err.end();
+      const text = out.text();
+      if (text.length > pushed) request.onData?.(text.slice(pushed));
+      resolve({ stdout: text, stderr: stripSshNoise(err.text()), exitCode: code, durationMs: Date.now() - started });
     });
   });
 }
@@ -217,14 +290,12 @@ export function copyOpenSsh(profile: HostProfile, direction: "put" | "get", loca
   return ensureControlMaster(profile).then(() => new Promise<void>((resolve, reject) => {
     // 同上：scp 也走同一套 ControlMaster，stdin 必须保持 pipe。
     const child = spawn("scp", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
+    const err = collect(child.stderr);
     child.on("error", reject);
     child.on("close", (code) => {
+      err.end();
       if (code === 0) resolve();
-      else reject(new Error(stderr.trim() || `scp 退出码 ${code}`));
+      else reject(new Error(err.text().trim() || `scp 退出码 ${code}`));
     });
   }));
 }

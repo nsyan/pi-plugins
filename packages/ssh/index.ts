@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readAudit, defaultAuditPath } from "./src/core/audit.js";
 import { loadHosts, saveHosts, defaultConfigPath } from "./src/core/config.js";
 import { doctorLines } from "./src/core/doctor.js";
 import { closeControlMasters } from "./src/transports/openssh.js";
@@ -14,6 +13,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { describeHosts } from "./src/prompt.js";
 import { createRuntime } from "./src/runtime.js";
+import { confirmRemoteAction } from "./src/ui/confirm.js";
+import { handleSshCommand, type PanelDeps } from "./src/ui/panel.js";
 
 const runtime = createRuntime();
 
@@ -62,6 +63,18 @@ async function readSecret(
 }
 
 /**
+ * 把宿主的 ctx 适配成 runtime 的 ConfirmUi。
+ * 结构化弹窗（Markdown：理由/分级/命令分块高亮）需要 ctx.mode，所以这里传整个 ctx 而不是 ctx.ui。
+ */
+function confirmUiOf(ctx: any) {
+  return {
+    confirm: (title: string, message: string) => ctx.ui.confirm(title, message),
+    confirmAction: (info: Parameters<typeof confirmRemoteAction>[1]) => confirmRemoteAction(ctx, info),
+    secret: (title: string, prompt: string) => readSecret(ctx, title, prompt),
+  };
+}
+
+/**
  * 首次连接的指纹必须给人看过才算数。
  * 未知密钥先失败，把指纹摆出来让人确认，确认后才写 known_hosts。
  */
@@ -71,19 +84,6 @@ async function confirmUnknownKey(
 ): Promise<boolean> {
   if (!(error instanceof HostKeyUnknownError)) return false;
   return ui.confirm("未知主机密钥", `${error.message}\n\n用 ssh-keygen -lf 核对后，确认记录这个指纹并继续？`);
-}
-
-async function testWithTofu(
-  hostName: string | undefined,
-  ui: { confirm: (title: string, message: string) => Promise<boolean> },
-) {
-  try {
-    // 命令侧允许缺省打活动主机；工具调用仍然必须显式传 host。
-    return await runtime.testHost({ host: hostName, allowActive: true });
-  } catch (error) {
-    if (!(await confirmUnknownKey(error, ui))) throw error;
-    return runtime.testHost({ host: hostName, allowActive: true, acceptNewHostKey: true });
-  }
 }
 
 /** 测一个还没入库的候选。通过才写盘，拒绝指纹 = 不保存。 */
@@ -215,7 +215,7 @@ export default function sshExtension(pi: ExtensionAPI) {
             lastBytes += chunk.length;
             flush();
           },
-          ui: ctx.ui,
+          ui: confirmUiOf(ctx),
         });
         flush(true);
         const status = result.exitCode === null ? "超时或中止" : `退出码 ${result.exitCode}`;
@@ -243,7 +243,7 @@ export default function sshExtension(pi: ExtensionAPI) {
         let lastBytes = 0;
         const result = await runtime.put({
           ...params,
-          ui: ctx.ui,
+          ui: confirmUiOf(ctx),
           onProgress: (sent, total) => {
             const now = Date.now();
             if (now - lastAt < 100 && sent - lastBytes < 8192 && sent < total) return;
@@ -294,10 +294,7 @@ export default function sshExtension(pi: ExtensionAPI) {
       try {
         const result = await runtime.sudo({
           ...params,
-          ui: {
-            confirm: (title, message) => ctx.ui.confirm(title, message),
-            secret: async (title, prompt) => readSecret(ctx, title, prompt),
-          },
+          ui: confirmUiOf(ctx),
         });
         return text(`退出码 ${result.exitCode}\n${result.text}`, { exitCode: result.exitCode });
       } catch (error) {
@@ -320,7 +317,7 @@ export default function sshExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
-        const opened = await runtime.tunnel({ ...params, ui: ctx.ui });
+        const opened = await runtime.tunnel({ ...params, ui: confirmUiOf(ctx) });
         return text(`127.0.0.1:${opened.port} -> ${params.destHost}:${params.destPort}`, { port: opened.port });
       } catch (error) {
         return failure(error);
@@ -347,7 +344,7 @@ export default function sshExtension(pi: ExtensionAPI) {
           ...params,
           signal,
           onStep: (message) => onUpdate?.({ content: [{ type: "text", text: message }], details: { step: message } }),
-          ui: ctx.ui,
+          ui: confirmUiOf(ctx),
         });
         if (result.dryRun) return text(`只生成剧本，未执行。目标 ${result.current}`, result);
         return text(result.rolledBack ? `健康检查失败，已切回 ${result.current}` : `已切换到 ${result.current}`, result);
@@ -379,7 +376,7 @@ export default function sshExtension(pi: ExtensionAPI) {
           file: params.target.kind === "file" ? params.target.path : undefined,
           to: params.target.kind === "release" ? params.target.to : undefined,
           reason: params.reason,
-          ui: ctx.ui,
+          ui: confirmUiOf(ctx),
         });
         return text(`已回滚到 ${result.current}`, result);
       } catch (error) {
@@ -468,130 +465,18 @@ export default function sshExtension(pi: ExtensionAPI) {
     },
   });
 
+  // /ssh 管理面板：面板逻辑在 src/ui/panel.ts（纯 ctx.ui，TUI 与 pi web 同一份），
+  // 这里只注入运行时与掩码输入。此前无参数只发一条 notify，web 端就是个 toast。
+  const panelDeps: PanelDeps = {
+    runtime,
+    confirmUi: (ctx: any) => confirmUiOf(ctx),
+    readSecret,
+  };
+
   pi.registerCommand("ssh", {
-    description: "查看、测试或切换 SSH 主机",
+    description: "SSH 主机管理面板：查看、测试、切换、新增、编辑、策略与审计",
     async handler(args, ctx) {
-      const [sub, name] = args.trim().split(/\s+/, 2);
-      const file = loadHosts();
-      if (!sub || sub === "ls") {
-        ctx.ui.notify(describeHosts(file), "info");
-        return;
-      }
-      if (sub === "use") {
-        if (!file.hosts[name]) {
-          ctx.ui.notify(`没有名为 ${name} 的主机`, "error");
-          return;
-        }
-        saveHosts(defaultConfigPath(), { ...file, activeHost: name });
-        ctx.ui.notify(`活动主机已切换为 ${name}`, "info");
-        return;
-      }
-      if (sub === "test") {
-        try {
-          const result = await testWithTofu(name, ctx.ui);
-          ctx.ui.notify(`${name || "活动主机"} ${result.auth} ${result.fingerprint || "无指纹"} ${result.latencyMs}ms`, result.ok ? "info" : "error");
-        } catch (error) {
-          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-        }
-        return;
-      }
-      if (sub === "rm") {
-        if (!file.hosts[name]) {
-          ctx.ui.notify(`没有名为 ${name} 的主机`, "error");
-          return;
-        }
-        const accepted = await ctx.ui.confirm("删除主机", name);
-        if (!accepted) return;
-        const next = { ...file, hosts: { ...file.hosts } };
-        delete next.hosts[name];
-        if (next.activeHost === name) next.activeHost = undefined;
-        saveHosts(defaultConfigPath(), next);
-        ctx.ui.notify(`已删除 ${name}`, "info");
-        return;
-      }
-      if (sub === "grant") {
-        const minutes = Number(args.trim().split(/\s+/)[2] ?? 10);
-        const accepted = await ctx.ui.confirm("写授权", `${name} 在 ${minutes} 分钟内不再逐条确认写操作`);
-        if (!accepted) return;
-        try {
-          runtime.grantWrite(name, Number.isFinite(minutes) ? minutes : 10);
-          ctx.ui.notify(`${name} 的写操作在 ${minutes} 分钟内不再逐条确认。破坏性操作仍要确认。`, "info");
-        } catch (error) {
-          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-        }
-        return;
-      }
-      if (sub === "log") {
-        const rows = readAudit(defaultAuditPath()).slice(-20);
-        ctx.ui.notify(rows.map((row) => `${row.ts} ${row.tool} ${row.command}`).join("\n") || "没有审计", "info");
-        return;
-      }
-      if (sub === "add" || sub === "edit") {
-        const current = name ? file.hosts[name] : undefined;
-        if (sub === "edit" && !current) {
-          ctx.ui.notify(`没有名为 ${name} 的主机`, "error");
-          return;
-        }
-        const hostName = sub === "add" ? await ctx.ui.input("主机名", "") : name;
-        const address = await ctx.ui.input("地址", current?.host ?? "");
-        const user = await ctx.ui.input("用户", current?.user ?? "");
-        const keyPath = await ctx.ui.input("私钥路径，密码登录留空", current?.auth.privateKeyPath ?? "");
-        const prod = await ctx.ui.confirm("生产主机", "这台机器的标签要包含 prod 吗？生产主机的写操作一律确认。");
-        if (!hostName || !address || !user) return;
-        const saved = saveHostCandidate(loadHosts(), {
-          name: hostName,
-          host: address,
-          user,
-          privateKeyPath: keyPath || undefined,
-          tags: prod ? ["prod"] : current?.tags?.filter((tag) => tag !== "prod"),
-        }, sub === "edit" ? "overwrite" : "rename");
-        if (!saved.saved) {
-          ctx.ui.notify("未保存", "warning");
-          return;
-        }
-        const candidate = saved.file.hosts[saved.name];
-        let wroteSecret = false;
-        // 编辑时沿用原来的凭据；新密码按最终名字存，不用用户填的名字。
-        let secretRef = keyPath ? undefined : current?.auth.secretRef;
-        if (!keyPath) {
-          const password = await readSecret(ctx, "登录密码", "密码不进入对话记录");
-          if (!password && !secretRef) {
-            ctx.ui.notify("没有密码，未保存", "warning");
-            return;
-          }
-          if (password) {
-            putSecret(defaultSecretsPath(), saved.name, password);
-            wroteSecret = true;
-            secretRef = `file:${defaultSecretsPath()}#${saved.name}`;
-          }
-        }
-        const profile = { ...candidate, auth: { ...candidate.auth, secretRef } };
-        try {
-          const tested = await testProfileWithTofu(profile, ctx.ui);
-          saved.file.hosts[saved.name] = profile;
-          saveHosts(defaultConfigPath(), saved.file);
-          ctx.ui.notify(`已保存 ${saved.name}，${tested.auth} ${tested.fingerprint || "无指纹"} ${tested.latencyMs}ms`, "info");
-        } catch (error) {
-          if (wroteSecret) deleteSecret(defaultSecretsPath(), saved.name);
-          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-        }
-        return;
-      }
-      if (sub === "exec") {
-        const command = args.trim().slice("exec".length).trim();
-        if (!command) {
-          ctx.ui.notify("用法：/ssh exec <命令>", "error");
-          return;
-        }
-        try {
-          const result = await runtime.exec({ command, allowActive: true, ui: ctx.ui });
-          ctx.ui.notify(`退出码 ${result.exitCode}\n${result.text}`, result.exitCode === 0 ? "info" : "error");
-        } catch (error) {
-          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-        }
-        return;
-      }
-      ctx.ui.notify("用法：/ssh ls | add | edit <主机> | test <主机> | use <主机> | rm <主机> | exec <命令> | grant <主机> <分钟> | log", "info");
+      await handleSshCommand(args, ctx, panelDeps);
     },
   });
 }

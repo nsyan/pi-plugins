@@ -8,6 +8,7 @@ import type { Client, ConnectConfig } from "ssh2";
 
 const { Client: SshClient } = createRequire(import.meta.url)("ssh2") as typeof import("ssh2");
 import { wrapSudo, wrapWithWatchdog } from "../core/guard.js";
+import { StringDecoder } from "node:string_decoder";
 import { clipUtf8, parseRemoteHash, remoteHashCommand, sha256File } from "../core/hash.js";
 import { hostKeyFingerprint } from "../core/known-hosts.js";
 import { AuthFailedError, HostKeyUnknownError, TransferMismatchError, type HostProfile } from "../core/types.js";
@@ -276,6 +277,9 @@ export class Ssh2Pool {
           const start = Math.max(1, offset);
           const maxBytes = 512 * 1024;
           const stream = sftp.createReadStream(remotePath);
+          // SFTP 的 data 块边界与字符边界无关：逐块 chunk.toString("utf8") 会把一个
+          // 多字节字符切成两半，各块各解一次就得到两个替换符。必须用 StringDecoder 续接。
+          const decoder = new StringDecoder("utf8");
           let finished = false;
           const finish = () => {
             if (finished) return;
@@ -287,7 +291,7 @@ export class Ssh2Pool {
             resolve(picked.join("\n"));
           };
           stream.on("data", (chunk: Buffer) => {
-            const parts = (pending + chunk.toString("utf8")).split(/\n/);
+            const parts = (pending + decoder.write(chunk)).split(/\n/);
             pending = parts.pop() ?? "";
             for (const line of parts) {
               seen += 1;
@@ -478,15 +482,28 @@ export class Ssh2Pool {
           finish({ stdout, stderr, exitCode: null, durationMs: Date.now() - started });
         }, timeoutMs);
         request.signal?.addEventListener("abort", abort, { once: true });
+        // 命令输出可能含中文：块边界不等于字符边界，逐块 toString 会切出替换符。
+        // 用 StringDecoder 续接，close 时 end() 冲掉残留的半个字符。
+        const outDecoder = new StringDecoder("utf8");
+        const errDecoder = new StringDecoder("utf8");
         channel.on("data", (chunk: Buffer) => {
-          const text = chunk.toString("utf8");
+          const text = outDecoder.write(chunk);
+          if (text === "") return;
           absorb("out", text);
           request.onData?.(text);
         });
         channel.stderr.on("data", (chunk: Buffer) => {
-          absorb("err", chunk.toString("utf8"));
+          const text = errDecoder.write(chunk);
+          if (text !== "") absorb("err", text);
         });
         channel.on("close", (code: number | null) => {
+          const tailOut = outDecoder.end();
+          if (tailOut !== "") {
+            absorb("out", tailOut);
+            request.onData?.(tailOut);
+          }
+          const tailErr = errDecoder.end();
+          if (tailErr !== "") absorb("err", tailErr);
           finish({ stdout, stderr, exitCode: code, durationMs: Date.now() - started });
         });
       });

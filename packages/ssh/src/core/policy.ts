@@ -130,6 +130,18 @@ const WRITE: Rule[] = [
     summary: "移动、复制或修改文件",
     test: (c) => /\b(?:mv|cp|install|chmod|chown|tee|truncate)\b/.test(c),
   },
+  // 下面三条曾经漏判：只读模式下 mkdir/touch/ln 会被当成只读命令直接放行，
+  // 等于「只读」承诺失效（实测 `mkdir -p /tmp/x1` 在 readonly 下成功执行）。
+  { danger: "write", summary: "创建目录", test: (c) => /\bmkdir\b/.test(c) },
+  { danger: "write", summary: "创建或更新时间戳", test: (c) => /\btouch\b/.test(c) },
+  { danger: "write", summary: "创建链接", test: (c) => /\bln\b/.test(c) },
+  // git checkout 会覆盖工作区文件（`-- .`、`-- file`、`<commit> -- file` 都是写）；
+  // 只切分支/新建分支的 checkout 仍是读。
+  {
+    danger: "write",
+    summary: "用 git checkout 覆盖工作区文件",
+    test: (c) => /\bgit\s+checkout\b/.test(c) && (/\s--(?:\s|$)/.test(c) || /\bcheckout\s+\./.test(c)),
+  },
   { danger: "write", summary: "把输出写入文件", test: (c) => fileRedirectTarget(c) !== null },
   { danger: "write", summary: "执行动态拼接的命令，无法静态确认", test: (c) => /\beval\b/.test(c) },
 ];

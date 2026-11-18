@@ -319,3 +319,161 @@ openssh 那台「部署成功」是假象：ProxyJump / agent / 证书主机根�
 ### 8.3 仍存在的偏差（P2，未修）
 
 首轮报告 §4 的 P2 系列（`/ssh scan` 与 `/ssh config` 子命令缺失、`ssh_host_save` 无 transport 参数、`capabilities`/`verified` 字段未实现、`waitFor` 无本地回退、`ftp-srv` 未进 devDependencies 等）本轮未动，属功能补全而非缺陷，建议后续单独排期。
+
+---
+
+## 9. 发布与安装核验（2026-11-18 收尾）
+
+代码与文档已同步，但**发布链路踩了一次坑**，记录在此避免复发：
+
+| 检查项 | 结果 |
+|---|---|
+| npm 官方 registry `dist-tags.latest` | `0.1.1`（首个含 P0/P1 修复的版本；`0.1.0` 无这些修复） |
+| `0.1.1` tarball shasum | `e1c654e65edd2454ec92b05672cd8b2c4163507a`（26 文件 / 148.1 kB） |
+| 发布包内容与仓库 `src/`、`index.ts` | `diff -rq` 完全一致，5 个 P0 修复均在包内（`rejectArchiveMembers` 滤空行、`sha256File` 拒目录、`ftp.open` 用 `auth.password`、openssh `stdio: pipe`、`runnerFor`） |
+| 与 `0.1.0` 对比 | `0.1.0` 无任何 P0 修复（`stdio: ["ignore"]`、无 `runnerFor`、无目录校验），**0.1.0 是坏版本，不要装** |
+| 修复批次归属 | 第一轮 P0/P1 修复**全部包含在 0.1.1**；后续 `0.1.2`（管理面板）与 `0.1.3`（第二轮真机回归的 4 个 bug，见 §10）各自独立成版 |
+| `registry.npmmirror.com` | `latest` 一度仍指向占位包 `0.0.0-stage`；需 `curl -X PUT .../syncs` 触发回源，之后 `latest = 0.1.1` |
+
+**踩坑现象**：`~/.npmrc` 指向 npmmirror，`pi install npm:@nsyan/ssh` 按 `^0.0.0-stage` 解析到占位包，装出的是只有 `package.json` + `README.md` 的空壳（`"stub": true`，无 `index.ts`）。表现为插件页「已安装 0.0.0-stage」、**已解析资源为空**、13 个 `ssh_*` 工具全部不注册——而 pi 只在启动日志里静默记一条加载失败，界面上看起来是装好的。
+
+**判断装对没有**：`ls ~/.pi/agent/npm/node_modules/@nsyan/ssh` 必须有 `index.ts` 与 `src/`；`~/.pi/agent/npm/package.json` 里应是 `"@nsyan/ssh": "^0.1.x"`。
+
+**修复步骤**：
+
+```bash
+curl -X PUT https://registry.npmmirror.com/-/package/@nsyan/ssh/syncs   # 让镜像回源
+pi update npm:@nsyan/ssh                                               # 0.0.0-stage -> 0.1.1
+```
+
+或绕开镜像：`npm install @nsyan/ssh@latest --registry=https://registry.npmjs.org`。
+
+> 教训：**发版后先验镜像**。占位包占着 `latest` 时，镜像用户拿到的不是旧版而是空壳，比「版本落后」危险得多。`0.0.0-stage` 这类暂存包应在正式版发布后 `npm deprecate` 或直接 `unpublish`。
+
+---
+
+## 10. 第二轮真机全功能回归（2026-11-18，对照设计文档逐项跑）
+
+第一轮是「找 P0/P1 并修」；这一轮是**按设计文档 §8/§9 把 13 个工具、两条传输、全部策略分支真机跑一遍**，确认修复真的落地、并找残余问题。
+
+- 真机：`root@10.2.9.58`（Ubuntu 20.04.6，kernel 5.4，`/bin/sh` → dash，有 `setsid`/`bash`/`nc`/`curl`/`wget`/`sha256sum`，sudo 免密，9001 有 nginx）
+- 凭据：**全程用密钥**（`~/.ssh/id_ed25519_pi_szzf-58`），未使用也未索取密码
+- 环境：`/tmp/pi-ssh-e2e-20261118`（测后已清理，无残留进程与目录）
+- 单测：149 → **182**；`tsc` **0 error**
+
+### 10.1 本轮新发现的 4 个 bug（已修）
+
+| # | 问题 | 真机复现 | 影响 |
+|---|---|---|---|
+| N-1 | 确认框**不显示执行理由** | `ask()` 签名无 `reason` 参数；`ssh_exec` 的 reason 只进审计 | 用户被要求确认，却看不到「为什么执行」 |
+| N-2 | 确认框把**多行命令挤成一行** | 截图反馈：`set -e TS=... BASE=... rm -rf ...` 全糊在一起 | 纯文本 SelectList 折叠单换行，多行脚本无法核对 |
+| N-3 | **中文输出变替换符** | `ssh_read` 读 600KB 中文 → 174762 字符且含大量 U+FFFD | 日志/配置里的中文读出乱码；根因是逐块 `chunk.toString("utf8")` 切断多字节字符，**不是** `clipUtf8` |
+| N-4 | **只读模式漏放写命令** | readonly 下 `mkdir -p /tmp/x1` **执行成功**（`/tmp/x1` 真的被创建） | `mkdir`/`touch`/`ln`/`git checkout -- .` 未被 `classify()` 识别为写，「只读」承诺失效 |
+
+另补一个设计边界：openssh 传输的 `test` 原本恒返回空指纹。现用 `ssh-keyscan` 取密钥并按 ed25519 优先排序，**与 ssh2 报出的指纹完全一致**（`SHA256:Gi3H0…`，与 `ssh-keygen -F` 对照通过）。不排序会取到同机的 ECDSA 密钥，导致两条传输报不同指纹。
+
+### 10.2 逐项通过清单
+
+**执行与输出**
+- 只读命令 / `cwd` 生效 / stderr 分离 / 非零退出码（42）原样透传 / dash 语法
+- `seq 1 3000` → 截断 + 落盘，落盘文件 **3000 行完整无缺失**（`comm` 校验）
+- `waitFor` 三条件：port 就绪/未就绪（退出码 1）、http、file 存在/不存在
+
+**传输**
+- `ls` 结构化；`read` offset/limit/越界；空文件；无尾换行
+- 600KB 单行 CJK → 修复后**零替换符**
+- `put` 小文件/3MB 二进制 sha256 双端一致、无 `.part` 残留
+- `put` **传目录** → 「是目录…先打成压缩包」，**进程存活**
+- 覆盖 4 次 → 备份只留最新 3 份
+- `get` 小文件/3MB sha256 与远端一致；不存在的文件报错
+
+**部署与回滚**
+- `dryRun` 不碰远端（releases 为空、无 `current`）
+- tar 部署成功：子目录完整、`.part` 清理、`shared/` 未被写（P0-1 确认）
+- 健康检查失败 → **自动回退**，`rolledBack: true`，`current` 回到部署前版本
+- release 回滚跳过 `.part` 残留；显式指定 `.part` 被拒；`../evil` 被拒
+- **文件回滚从 `.pi-ssh-backup` 成功恢复**；无备份时报错**列出找过的两个位置**
+- openssh 传输下 tar 与 file 两种剧本都成功（P0-5 确认）
+- FTP 主机的 `deploy`/`rollback`/`exec`/`read` 全部 `UnsupportedError`，不再是误导性的 `ECONNREFUSED`
+
+**策略与审计**
+- 生产主机：缺 `reason` 拒、**拒绝授予会话级写授权**、destructive 一次动作只写 **1 条**审计（P1-10 确认）
+- 只读模式：read 放行；write/destructive/sudo/put/deploy/rollback 全部拒绝
+- 用户拒绝确认 → `ConfirmRejectedError`，且**命令确实没执行**（探针文件 `STILL_THERE`）
+- `put` 审计含 `bytes`/`sha256`/`backupPath`（P1-11 确认）
+- `test` 已连接后指纹非空、延迟 20ms（P1-5 确认）
+
+**看门狗**
+- dash 远端超时 → `sleep 300/301` **无残留**
+- 命令内部 `setsid` 派生 → **有残留**（见 10.3）
+
+**隧道**
+- local：本机 54588 → 远端 9001，HTTP 200 / 2063 bytes
+- remote：远端 18081 → 本机 18080，HTTP 200 / 16591 bytes
+
+**openssh 传输**
+- `test` 指纹与 ssh2 一致（修复后）
+- ControlMaster 复用后连续 5 次 exec **全部正常**，无 143 / 空输出（P0-4 确认）
+- 大输出截断落盘；中文输出无替换符
+
+**扫描建连**
+- `ssh_scan_sources` 扫出 `.env` 与 `deploy/`
+- 同名 `skip` 生效；坏端口「先测后写」**未落盘**
+
+### 10.3 仍存在的缺陷（本轮未修）
+
+**命令内部自己 `setsid` 派生的进程会逃出看门狗进程组**：
+
+```
+$ setsid sh -c 'sleep 302; echo LEAKED2 > /tmp/marker' & echo spawned; sleep 300
+（超时后）
+$ ps -ef | grep "sleep 302"
+root 13351  1  sh -c sleep 302; ...
+root 13353  13351  sleep 302      ← 仍然活着
+```
+
+普通超时、`nohup`、`&` 派生都能清掉，但 `setsid` 建了**新会话**，`kill -TERM -$pid` 打不到。这是 P1-12 的残余场景。
+
+修法有两条，都不便宜：① `pkill -P` 递归杀子进程（仍有竞态，且 `setsid` 后父子关系已断）；② 用 cgroup v2 把命令关进独立 cgroup（Linux 限定，且需要写权限）。**建议先按现状记入文档**，等真有长任务场景再评估。
+
+### 10.4 结论
+
+第一轮的 5 P0 + 13 P1 全部确认修复；本轮又找出 4 个新 bug（确认框信息缺失 2 个、编码 1 个、策略漏判 1 个），已全部修完并加回归测试。策略层这次的漏判值得单独记一笔：**`classify()` 的「写」规则是白名单式的**，漏一个命令就等于只读模式放行一条写路径，新增命令识别时务必同步补单测。
+
+---
+
+## 11. 面板（0.1.2 大改动）的回归覆盖说明
+
+§10 那轮真机回归主要跑的是**工具层**（13 个 `ssh_*`）。`0.1.2` 引入的 `/ssh` 管理面板是另一条路径（`src/ui/panel.ts`，约 1000 行），它的验证层次与前几轮不同，这里明确交代边界，避免下次升级时误判「已覆盖」。
+
+### 11.1 面板覆盖了什么
+
+- **单测**：`test/panel.test.ts`（33 项）覆盖纯函数与路由——`parseHostSpec`（含 IPv6 与端口越界）、`withProdTag`、`hostSummaryLine`/`buildHostList`（活动主机置顶）、`authSummary`（密码只说有没有保存）、`hostDetailLines`、`policyLines`/`effectivePolicy`、`auditLines`（过滤/截断/退出码）、`buildProfile`（编辑保留字段、换认证清引用）、`describeTestResult`，以及用**假 `ctx.ui`** 跑通 `/ssh` 无参开面板、`ls`/`config`/`rm`/`use`/`grant`/未知子命令的路由与写盘；另有 4 条写盘边界回归（改名时密码只落最终名字、改名时密码条目与活动指针一起迁移、传输方式按名字解析、实测失败不写盘且回滚密码）
+- **真机**：`0.1.3` 那轮用 `runtime.*` 直驱跑了工具层，**面板本身没有在真机 TUI 里逐项点过**
+
+### 11.2 为什么面板不能只靠单测
+
+面板的真实风险在**渲染与交互**，而假 `ctx.ui` 测不出来：
+
+| 风险 | 单测能否发现 | 说明 |
+|---|---|---|
+| 菜单项与实际分支不一致 | 部分 | 假 `ctx.ui` 只回放预设选择，点错分支不会暴露 |
+| `select` 在 pi web（RPC）下不可用/降级 | 否 | RPC 没有 TUI 的 `custom`，行为不同 |
+| 掩码输入在 RPC 下退化成明文 | 否 | 需要真实通道才能观察 |
+| 多级菜单的返回/取消死循环 | 否 | 需要真实交互 |
+| 长标题/长主机名把菜单撑破 | 否 | 渲染层问题 |
+| 写盘后活动指针/密码条目残留 | 是 | 这 4 条已单测覆盖 |
+
+### 11.3 面板的真机回归清单
+
+已单独整理成 **`ssh-regression-checklist.md` §1**（10 个小节：顶层面板、单台二级菜单、新增主机、编辑与改名、更新凭据、部署布局、策略设置、审计日志、子命令一致性、pi web 降级）。
+
+**下次发版前必须人眼过一遍 §1**，特别是：
+- §1.3 的「坏端口不落盘」与「未知指纹先核对」
+- §1.4 的「编辑不抹 `deploy`/`tags`」与「改名迁移活动指针」
+- §1.9 的子命令与面板**行为一致**（这是 0.1.2 的核心设计目标：不分叉）
+- §1.10 的 pi web 降级
+
+### 11.4 结论
+
+`0.1.2` 面板的**逻辑正确性**有单测兜底（33 项 + 4 条写盘边界），**交互与渲染**目前只有代码审查，没有真机记录。这是一处已知的验证缺口，已写进回归手册而不是假装覆盖过。

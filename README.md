@@ -15,6 +15,8 @@
 | [db](./packages/db) | AI 接入数据库 —— 方言化架构，支持 PostgreSQL/MySQL/Oracle/达梦/Redis/Elasticsearch/MongoDB/Neo4j/Hive/Spark 十种数据库，提供查询/表结构/扫描建连工具 |
 | [ssh](./packages/ssh) | AI 远程运维 —— SSH/SFTP/FTP：13 个 ssh_* 工具 + `/ssh` 管理面板，危险命令分级确认、JSONL 审计、known_hosts 校验、release+软链部署与自动回滚 |
 
+> 装到 `0.0.0-stage` 是镜像上的占位空壳（无 `index.ts`，工具不注册）：`curl -X PUT https://registry.npmmirror.com/-/package/@nsyan/ssh/syncs` 后 `pi update npm:@nsyan/ssh`。详见 [packages/ssh/README.md](./packages/ssh/README.md#-安装)。
+
 ## 🚀 安装
 
 使用 pi 命令从 npm 安装（推荐）：
@@ -59,7 +61,7 @@ pnpm test             # 运行全部包的测试
 
 ## 📜 更新记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.5**（2026-10-21，修复 hive/spark 依赖链缺 `ws` 致扩展整体加载失败）、ssh **0.1.1**（openssh 传输补齐、首次连接指纹确认、doctor 按 PATH 探测）。
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.7**（2026-11-19，读写判定改为白名单，只读模式真正拦住 `COPY`/`GRANT`/`SET`/`VACUUM`/`DO`/`EXPLAIN ANALYZE` 等此前漏判的写语句；生产连接写审计改为先落盘再执行；配置改原子写且损坏不再静默当成空列表）、ssh **0.1.4**（2026-11-18，`/ssh` 面板代码审查修掉 8 个缺陷：编辑输错密码不再销毁旧密码、复制不再静默覆盖同名主机、复制出的主机不共用凭据引用、FTP 必问密码、端口可清空回默认、坏审计行不再崩面板、单主机 `exec` 不空跑、编辑可取消 prod 标签）。
 
 ## 📄 许可
 

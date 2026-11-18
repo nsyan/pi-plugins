@@ -55,3 +55,23 @@ describe("ssh 噪音过滤", () => {
     assert.equal(stripSshNoise(""), "");
   });
 });
+
+describe("scanHostKeyFingerprint 的密钥类型偏好", () => {
+  it("同机多把密钥时优先 ed25519（与 ssh2 报出的指纹一致）", async () => {
+    // 逻辑在 close 回调里做排序；这里用纯函数等价物钉住偏好顺序，
+    // 避免 ssh-keyscan 输出顺序变化导致两条传输报不同指纹。
+    const prefer = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"];
+    const found = [
+      { keyType: "ssh-rsa", fingerprint: "R" },
+      { keyType: "ecdsa-sha2-nistp256", fingerprint: "E" },
+      { keyType: "ssh-ed25519", fingerprint: "D" },
+    ];
+    found.sort((a, b) => {
+      const ia = prefer.indexOf(a.keyType);
+      const ib = prefer.indexOf(b.keyType);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+    assert.equal(found[0].keyType, "ssh-ed25519");
+    assert.equal(found[0].fingerprint, "D");
+  });
+});

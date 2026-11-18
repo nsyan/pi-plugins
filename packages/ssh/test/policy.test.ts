@@ -48,6 +48,13 @@ describe("classify 命中表", () => {
     ["chown deploy env.sh", "移动、复制或修改文件"],
     ["tee /tmp/out", "移动、复制或修改文件"],
     ["truncate -s 0 app.log", "移动、复制或修改文件"],
+    // 回归：这四条曾被漏判为 read，只读模式下直接放行（实测 mkdir 能执行成功）
+    ["mkdir -p /tmp/x", "创建目录"],
+    ["mkdir x", "创建目录"],
+    ["touch /tmp/a", "创建或更新时间戳"],
+    ["ln -s a b", "创建链接"],
+    ["git checkout -- .", "用 git checkout 覆盖工作区文件"],
+    ["git checkout -- file.txt", "用 git checkout 覆盖工作区文件"],
     ["systemctl restart app", "重启或设置服务开机启动"],
     ["systemctl reload nginx", "重启或设置服务开机启动"],
     ["systemctl enable app", "重启或设置服务开机启动"],

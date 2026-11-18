@@ -480,22 +480,30 @@ ssh_rollback {
 ### 10.1 `/ssh` 命令（无参数弹菜单，子命令直达）
 
 ```
-/ssh                菜单：测试连接 / 切换活动主机 / 新增 / 编辑 / 删除 /
-                         密钥管理 / 扫描建连 / 策略 / 审计日志
+/ssh                菜单：主机列表/单台管理 / 切换活动 / 新增 / 扫描建连 /
+                         测试全部 / 策略 / 审计 / 本机体检
 /ssh add            新增：粘贴 user@host:port 一键 / 逐步填写 / 从现有复制
-/ssh edit <name>    编辑
-/ssh rm <name>      删除（确认）
+/ssh edit [name]    编辑连接信息（传输/认证/端口），不给名字就弹选择
+/ssh rm [name]      删除（确认，密码条目一并清）
 /ssh ls             列表
-/ssh use <name>     切换活动主机
-/ssh test <name>    实测
+/ssh use <name>     切换活动主机（再跑一次 = 取消）
+/ssh test [name]    实测（未知指纹先摆出来核对）
+/ssh testall        一次测完所有主机，未知指纹只报出、不逐个弹
 /ssh scan           引导语：告诉用户在对话里说「把这项目的服务器加进来」
-/ssh config         策略：只读开关 / 确认级别 / 审计开关
-/ssh log [n]        最近 n 条审计（缺省 20）
+/ssh config         策略：只读开关 / 确认级别 / 恢复默认
+/ssh log [主机|n]   审计（不带参数先选范围，缺省 20 条）
+/ssh doctor         本机体检
+/ssh grant <name> <分钟>  会话级写授权（生产主机拒绝）
 /ssh exec <命令>    在活动主机执行。这是唯一的远程执行入口，避免 /ssh ls 分不清是列主机还是远端 ls
 ```
 
-子命令名保留：`add` `edit` `rm` `ls` `use` `test` `scan` `config` `log` `exec`。
+子命令名保留：`add` `edit` `rm` `ls` `use` `test` `testall` `scan` `config` `log` `doctor` `grant` `exec`。
 不存在「`/ssh` 后面整段当远程命令」。
+
+**实现口径（0.1.2 落地）**：面板逻辑全部在 `src/ui/panel.ts`，子命令与菜单走同一批函数（`handleSshCommand` 统一路由），
+不出现「命令能改、面板不能改」的分叉；面板只用 `ctx.ui` 的 select/confirm/input/notify，
+TUI 与 pi web（RPC）同一份代码。单台主机的二级菜单含：测试、详情、设为/取消活动、加/去 prod 标签、
+更新凭据、编辑连接信息、编辑部署布局、执行命令、会话写授权、该主机审计、删除。
 
 新增主机的认证步骤：选「密钥」则给路径或现场 `ssh_keygen`；选「密码」则掩码弹窗（§5）。
 保存前**必须实测连接**。SSH 首次连接弹主机密钥指纹确认（TOFU），拒绝指纹 = 不保存。
@@ -695,3 +703,50 @@ ssh_rollback {
 - `ssh_deploy` / `ssh_rollback` 只读主机上的 `deploy` 布局。`restartCmd` 必须出现在确认文案里。
 - 新密码不进 `security -w`。macOS 写入钥匙串做不到不暴露进程参数，改落 0600 文件。
 - `prod` 标签在 `/ssh add` 与 `/ssh edit` 里由用户确认，扫描不推断。
+
+### 2026-11-18 真机 E2E 后的口径更正（重要：上一轮的「已修复」并非全部落地）
+
+上一节多条「已修复」与真机实测不符，按报告 `docs/superpowers/reports/2026-11-18-ssh-e2e-test-report.md` 更正并补修：
+
+- **§6.2 看门狗**：上一轮写「先 `exec 3<&0` … 本机 `sh` 实跑验证」。真机 dash 下 `set -m` 返回 0 但 job control 未开启（`$-` 里没有 `m`），`kill -TERM -$pid` 变成 `kill: No such process`，组杀形同虚设；`setsid`/`nohup` 派生的子进程必然残留。现改为**判 `$-` 而非 `set -m` 的退出码**，无 job control 时用 `setsid` 建独立进程组；两者都没有时降级为「超时只关通道」，并把降级事实写进 stderr（§6.2 已改口径）。sudo 的 heredoc 也必须挂在**最外层调用**上：嵌进 `sh -c '...'` 的引号里，`$PI_SSH_PW` 到不了内层（未 export）。
+- **§4.2 openssh 传输**：`sftp -b -` 属实，但同段的 `execOpenSsh` 用 `stdio: ["ignore", ...]`，而看门狗靠 `exec 3<&0` 判断客户端是否放弃——fd 0 是 `/dev/null`，fd 3 立刻 EOF，watcher 把命令自己杀掉（exit 143 + 空输出，复现率 4/5，**首次调用通常成功、之后全挂**）。现 stdin 一律 `pipe` 且不 `end()`。
+- **§4.1 三条上传路径对齐**：FTP 路径的密码解析没对齐——`ftp.open()` 读 `secretRef`（`file:...#name` 引用）而明文在 `auth.password`，服务端收到引用字符串必然 530；而「新密码一律落 0600 文件」意味着生产路径必然走这一种。现统一走 `resolveProfile()`。
+- **§8 清理旧版本**：用 `plan.releasesDir` 属实，但 tar 分支本身跑不到——`rejectArchiveMembers` 把 `tar -tzf` 输出末尾的空串当越界成员，**任何合法包都被整包拒绝**。现先滤空行再判定。
+- **§6.3 审计**：生产主机 destructive 改到动作之前写属实，但同时保留了动作后那条，变成一次动作两条记录。现动作前已写则跳过动作后那条；`put`/`get` 补 `bytes`/`sha256`/`backupPath`。
+- **§8 步骤 5 健康检查远端循环**：属实，但 `ssh_rollback` 完全没接健康检查（只有 `ln -sfn` + 重启）。现补上，且 release 回滚候选过滤 `.part`（此前会把 `releases/zz.part` 当 release 切上去，站点直接 404）。
+- **§8 失败回退**：确认框写「健康检查失败会自动回退」，但**重启失败**这条路径没有回退，`current` 停在新版本。现重启失败与健康检查失败共用同一条 `fallback`，回退时的重启用 `tryRun`，不掩盖「已回退」。
+- **§4.2 部署/回滚走哪条传输**：`deploy`/`rollback` 此前无条件 `connect()` + `pool.*`，openssh 主机被静默改走 ssh2 直连（ProxyJump/agent/证书主机根本连不上却「看起来成功」），FTP 主机报无关的 `ECONNREFUSED`。现按 `transport` 分流（`runnerFor`），FTP 明确 `UnsupportedError`。
+- **§3 / §7.2 输出预算与 spillPath**：ssh2 传输层的 2000 行判定用的是「已累积」而非「本块」，一次到达的 3001 行永远触发不了上限；`ExecResult.spillPath` 从不回填。现按「加上本块之后」判定并由 runtime 回填，openssh 输出统一过 `tail()`。
+- **§6.4 文件回滚**：备份在 `<root>/.pi-ssh-backup/<rel>.<ts>`，而 `rollback({file})` 只找 `<path>.bak.*`，部署根内的文件**永远回滚不了**。现两处规则统一，失败时列出找过的位置。
+
+仍成立、但当时未如实声明的边界（现已在 §4.3 / §5 写明）：FTP 无远端 sha256，完整性只核对字节数；`ssh_hosts test` 报的认证方式是配置里的 kind 而非协商结果；macOS 新密码不进 `security -w`。
+
+§4 的 P2 系列（`/ssh scan` 与 `/ssh config` 子命令、`ssh_host_save` 的 `transport` 参数、`Transport.capabilities`、`TransferResult.verified`、`waitFor` 本地回退、`ftp-srv` 测试依赖）本轮未动，属功能补全，已在 `packages/ssh/README.md` 的「已知限制」逐条列出。
+
+### 2026-11-18 面板补齐（0.1.2）
+
+用户截图反馈：`/ssh` 无参数在 pi web 里只出一个瞬时 toast，而 `/db` 有可点的面板。根因不是渲染差异，而是**面板从未实现**：
+`/ssh` handler 在无参数时只调 `ctx.ui.notify(describeHosts(file))`，整个包 0 次 `ctx.ui.select`；
+设计文档 §10.1 要求的菜单与文件树里的 `src/ui/panel.ts` 都只停在文档上。
+
+现按 §10.1 落地：
+
+- 新增 `src/ui/panel.ts`（零 pi 依赖，只用 `ctx.ui` 的 select/confirm/input/notify）——两级菜单、子命令统一路由（`handleSshCommand`），面板与命令不分叉
+- 补齐 `config` / `doctor` / `testall` / `scan` 引导；`log` 支持按主机过滤；`grant` 与 `exec` 进菜单
+- 新增主机可选 transport（auto/ssh2/openssh/ftp/ftps 含隐式 TLS 与跳过证书校验）与认证方式（密钥/密码/agent），新增「从现有复制」
+- 写盘纪律与工具侧一致：先实测再写盘、未知指纹先摆出核对、密码失败/改名时回滚引用、改名迁移旧键与活动指针；`buildProfile` 以 `existing` 为底，改地址不抹 `deploy`/`defaults`/`tags`
+- 部署布局可视化编辑（留空 root = 清除）；审计按主机过滤与长命令截断
+- 纯函数与路由单测 `test/panel.test.ts` 28 项（含用假 `ctx.ui` 跑 `/ssh` 无参开面板与各子命令写盘），测试 149 → 177
+
+仍属未做：`ssh_host_save`（工具侧）不暴露 `transport`/`secure`，扫描建连只产出 ssh 候选；`waitFor` 仍无本地回退。
+
+### 2026-11-18 第二轮真机回归后的补充（0.1.3）
+
+按本文件 §8/§9 在真机（Ubuntu 20.04 + dash）逐项跑 13 个工具与两条传输后，补修 4 处与本文承诺不符的实现：
+
+- **§6.1 / §9「确认」列**：本文要求确认框「展示完整剧本」「写明会自动回退」，但实现只把 `title` 与 `command` 传给 `ctx.ui.confirm`，**`reason` 从未进入确认框**（只进审计），且纯文本渲染会把多行命令折叠成一行。现新增 `src/ui/confirm.ts` 统一渲染：引用块写理由、列表写分级/主机/影响/传输、代码块写命令（带语言标记，TUI 与 pi-web 同一份 Markdown）。
+- **§7.2 输出**：块边界不等于字符边界，逐块 `chunk.toString("utf8")` 会切断多字节字符。现 ssh2 的 read/exec 与 openssh 的 exec/scp/sftp 统一用 `StringDecoder` 续接。这条**不改变**本文的 50KB / 2000 行预算，只保证预算内的内容是完整字符。
+- **§6.1 危险度分级**：`classify()` 的「写」规则是白名单式的，`mkdir`/`touch`/`ln`/`git checkout -- .` 此前落在 `read`，只读模式直接放行。现补齐；**新增任何写命令识别时必须同步补 `test/policy.test.ts`**，漏一条就等于只读模式多开一条写路径。
+- **§4.2 openssh**：此前 `ssh_hosts test` 对 openssh 主机恒返回空指纹（本文未要求，但用户无法对照 `ssh-keygen -lf`）。现用 `ssh-keyscan` 取密钥，**按 ed25519 → ecdsa → rsa 排序**后再算指纹——同机多把密钥时输出顺序不保证，不排序会让两条传输报不同指纹。
+
+§6.2 看门狗的**已知残余**：命令内部自己 `setsid` 派生的进程会逃出进程组（普通超时/`nohup`/`&` 都能清）。彻底解决需 cgroup v2 或递归 `pkill -P`，本期不实现，已在 README「已知限制」与测试报告 §10.3 如实声明。

@@ -23,13 +23,19 @@ import {
 } from "./core/types.js";
 import { Ssh2Pool, type ConnectHooks } from "./transports/ssh2.js";
 import { chooseTransport } from "./scan/auto.js";
-import { copyOpenSsh, execOpenSsh, getOpenSsh, listOpenSsh, putOpenSsh, readOpenSsh, scpPutVerified } from "./transports/openssh.js";
+import { copyOpenSsh, execOpenSsh, getOpenSsh, listOpenSsh, putOpenSsh, readOpenSsh, scanHostKeyFingerprint, scpPutVerified } from "./transports/openssh.js";
 import { ftpExecRejected, ftpExists, ftpGet, ftpList, ftpPut } from "./transports/ftp.js";
+import type { RemoteConfirmInfo } from "./ui/confirm.js";
 
 const OUTPUT_LIMIT = 50_000;
 
 export interface ConfirmUi {
   confirm(title: string, message: string): Promise<boolean>;
+  /**
+   * 结构化确认（可选）。宿主提供时走 Markdown 弹窗：理由、分级、命令分块高亮。
+   * 不提供时 ask() 退回 confirm(title, message) 的纯文本路径。
+   */
+  confirmAction?(info: RemoteConfirmInfo): Promise<boolean>;
   secret?(title: string, prompt: string): Promise<string | undefined>;
 }
 
@@ -161,11 +167,20 @@ export function createRuntime(options: RuntimeOptions = {}) {
       await ftpList(await resolveProfile(host), ".");
       return { ok: true, auth: host.auth.kind, fingerprint: "", keyType: "", latencyMs: latencyMs(), transport: host.transport };
     }
-    // openssh 的主机密钥由系统 ssh 自己管，指纹不经我们手。
+    // openssh 的主机密钥校验交给系统 ssh 与 known_hosts，但指纹仍要报出来供人核对：
+    // 用 ssh-keyscan 取密钥原文再算同一个 SHA256。取不到就如实留空（不假装已知）。
     if (host.transport === "openssh") {
       const result = await execOpenSsh(await resolveProfile(host), { command: "echo ok" });
       if (result.exitCode !== 0) throw new AuthFailedError(result.stderr || `ssh 退出码 ${result.exitCode}`);
-      return { ok: true, auth: host.auth.kind, fingerprint: "", keyType: "", latencyMs: latencyMs(), transport: host.transport };
+      const key = await scanHostKeyFingerprint(host.host, host.port ?? 22).catch(() => undefined);
+      return {
+        ok: true,
+        auth: host.auth.kind,
+        fingerprint: key?.fingerprint ?? "",
+        keyType: key?.keyType ?? "",
+        latencyMs: latencyMs(),
+        transport: host.transport,
+      };
     }
     const identity = await connect(host, acceptNewHostKey);
     const result = await pool.exec(host.id, { command: "echo ok" });
@@ -295,9 +310,31 @@ function concrete(profile: HostProfile): HostProfile {
   return { ...profile, transport: chooseTransport(profile, text) };
 }
 
-async function ask(ui: ConfirmUi | undefined, title: string, message: string): Promise<void> {
+/** confirm 回退路径的纯文本正文：reason 在最前，命令保留换行（SelectList 会折叠，但至少不丢信息） */
+  function plainMessage(info: RemoteConfirmInfo): string {
+    const lines: string[] = [];
+    if (info.reason) lines.push(`执行理由：${info.reason}`);
+    if (info.danger) lines.push(`分级：${info.danger}`);
+    if (info.summary) lines.push(`影响：${info.summary}`);
+    for (const note of info.notes ?? []) lines.push(note);
+    if (info.command) {
+      lines.push("");
+      lines.push(info.command);
+    }
+    if (info.warning) lines.push("", `注意：${info.warning}`);
+    return lines.join("\n");
+  }
+
+/**
+   * 确认的唯一入口。宿主提供 confirmAction 时走结构化弹窗（理由 + 分级 + 分块命令），
+   * 否则退回 confirm 纯文本。两条路径都保证 reason 出现在正文里——此前 reason 只进审计，
+   * 用户在确认框里看不到「为什么执行这条命令」。
+   */
+  async function ask(ui: ConfirmUi | undefined, info: RemoteConfirmInfo): Promise<void> {
     if (!ui) throw new PolicyDeniedError("这次操作需要确认，但当前没有界面。");
-    const accepted = await ui.confirm(title, message);
+    const accepted = ui.confirmAction
+      ? await ui.confirmAction(info)
+      : await ui.confirm(`${info.host}：${info.action}`, plainMessage(info));
     if (!accepted) throw new ConfirmRejectedError("用户拒绝了这次操作，停止，不要换一种写法重试。");
   }
 
@@ -331,7 +368,20 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       const decision = decide(verdict, policyOf(file), host, grant ? { hostId: host.id, untilMs: grant } : null);
       if (decision === "deny") throw new PolicyDeniedError(`只读模式拒绝这条${verdict.danger === "destructive" ? "破坏性" : "写"}命令：${verdict.summary}`);
       if (host.transport === "ftp" || host.transport === "ftps") ftpExecRejected();
-      if (decision === "confirm") await ask(input.ui, `${host.name}：${verdict.summary}`, input.command);
+      if (decision === "confirm") {
+        await ask(input.ui, {
+          host: host.name,
+          action: verdict.summary,
+          danger: verdict.danger,
+          reason: input.reason,
+          summary: input.cwd ? `工作目录 ${input.cwd}` : undefined,
+          command: input.command,
+          notes: [
+            `传输：${host.transport}${isProdHost(host) ? "（生产主机）" : ""}`,
+            input.timeoutSec ? `超时：${input.timeoutSec}s` : undefined,
+          ].filter((item): item is string => Boolean(item)),
+        });
+      }
       if (isProdHost(host) && verdict.danger === "destructive") {
         appendAudit(auditPath, {
           host: host.name,
@@ -394,7 +444,14 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       if (host.transport === "openssh") throw new PolicyDeniedError("sudo 目前只走 ssh2 连接。");
       const verdict = classify(input.command);
       requireReason(host, verdict.danger, input.reason);
-      await ask(input.ui, `${host.name}：sudo ${verdict.summary}`, input.command);
+      await ask(input.ui, {
+        host: host.name,
+        action: `sudo ${verdict.summary}`,
+        danger: verdict.danger,
+        reason: input.reason,
+        command: input.command,
+        notes: ["以 root 执行（sudo -S）；密码走本地掩码输入，不进命令文本"],
+      });
       const password = await input.ui?.secret?.(`${host.name} 的 sudo 密码`, "密码不进入对话记录");
       if (!password) throw new ConfirmRejectedError("没有拿到 sudo 密码，已停止。");
       appendAudit(auditPath, {
@@ -427,7 +484,18 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         const ready = await resolveProfile(host);
         exists = await ftpExists(ready, input.remotePath);
         if (isProdHost(host) || exists) {
-          await ask(input.ui, `${host.name}：上传${exists ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
+          await ask(input.ui, {
+            host: host.name,
+            action: `FTP 上传${exists ? "并覆盖" : ""}`,
+            danger: "write",
+            summary: exists ? "目标已存在，原文件会先备份再替换" : "目标不存在，直接写入",
+            command: `${input.localPath}\n  -> ${input.remotePath}`,
+            lang: "text",
+            notes: [
+              "传输：ftp/ftps（只有字节数核对，没有远端 sha256）",
+              isProdHost(host) ? "生产主机：一律确认" : undefined,
+            ].filter((item): item is string => Boolean(item)),
+          });
         }
         const result = await ftpPut(ready, input.localPath, input.remotePath, exists);
         appendAudit(auditPath, {
@@ -445,7 +513,20 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       }
       if (host.transport === "openssh") {
         exists = (await execOpenSsh(host, { command: `if [ -e ${shellQuote(input.remotePath)} ]; then echo yes; fi` })).stdout.includes("yes");
-        if (isProdHost(host) || exists) await ask(input.ui, `${host.name}：上传${exists ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
+        if (isProdHost(host) || exists) {
+          await ask(input.ui, {
+            host: host.name,
+            action: `scp 上传${exists ? "并覆盖" : ""}`,
+            danger: "write",
+            summary: exists ? "目标已存在，原文件会先备份再替换" : "目标不存在，直接写入",
+            command: `${input.localPath}\n  -> ${input.remotePath}`,
+            lang: "text",
+            notes: [
+              "传输：openssh/scp（双端 sha256 校验）",
+              isProdHost(host) ? "生产主机：一律确认" : undefined,
+            ].filter((item): item is string => Boolean(item)),
+          });
+        }
         const result = await putOpenSsh(host, input.localPath, input.remotePath, exists ? backupPath : undefined);
         if (exists && result.backupPath) await pruneBackups(opensshRunner(host), result.backupPath);
         appendAudit(auditPath, {
@@ -465,7 +546,18 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       const listed = await pool.exec(host.id, { command: `if [ -e ${shellQuote(input.remotePath)} ]; then echo yes; fi` });
       const overwrite = listed.stdout.includes("yes");
       if (isProdHost(host) || overwrite) {
-        await ask(input.ui, `${host.name}：上传${overwrite ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
+        await ask(input.ui, {
+          host: host.name,
+          action: `上传${overwrite ? "并覆盖" : ""}`,
+          danger: "write",
+          summary: overwrite ? "目标已存在，原文件会先备份再替换" : "目标不存在，直接写入",
+          command: `${input.localPath}\n  -> ${input.remotePath}`,
+          lang: "text",
+          notes: [
+            "传输：ssh2/sftp（.part 转正 + 双端 sha256）",
+            isProdHost(host) ? "生产主机：一律确认" : undefined,
+          ].filter((item): item is string => Boolean(item)),
+        });
       }
       const result = await pool.put(host.id, { localPath: input.localPath, remotePath: input.remotePath, backupPath: overwrite ? backupPath : undefined, onProgress: input.onProgress });
       if (overwrite && result.backupPath) await pruneBackups(poolRunner(host.id), result.backupPath);
@@ -544,18 +636,30 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         .filter((item) => item !== releaseId && !previous.endsWith(`/${item}`))
         .sort()
         .slice(0, Math.max(0, existing.length + 1 - keep));
-      await ask(
-        input.ui,
-        `${host.name}：部署 ${releaseId}`,
-        [
-          `${input.localPath} -> ${plan.releaseDir}`,
-          `切换 ${plan.currentLink}`,
-          restartCmd ? `重启：${restartCmd}` : "没有重启命令",
-          healthCmd ? "健康检查失败会自动切回上一版，这一步不再次确认。" : "没有健康检查，失败不会自动回滚。",
-          doomed.length > 0 ? `将删除旧版本：${doomed.join("、")}` : "没有旧版本需要删除。",
-          "shared/ 不写入。",
+      await ask(input.ui, {
+        host: host.name,
+        action: `部署 ${releaseId}`,
+        danger: "destructive",
+        reason: input.reason,
+        summary: `${kind === "tar" ? "压缩包" : "单文件"}发布到 ${plan.releaseDir}`,
+        command: [
+          `${input.localPath}`,
+          `  -> ${plan.releaseDir}`,
+          `ln -sfn ${releaseId} ${plan.currentLink}`,
+          restartCmd ? restartCmd : "# 没有重启命令",
+          healthCmd ? `# 健康检查：${healthCmd}` : "# 没有健康检查",
         ].join("\n"),
-      );
+        lang: "bash",
+        notes: [
+          `切换点：${plan.currentLink} -> ${releaseId}`,
+          restartCmd ? `重启：\`${restartCmd}\`` : "没有重启命令",
+          doomed.length > 0 ? `将删除旧版本：${doomed.join("、")}` : "没有旧版本需要删除",
+          "shared/ 不写入",
+        ],
+        warning: healthCmd
+          ? "健康检查失败会自动切回上一版，这一步不再次确认；重启失败同样会回退。"
+          : "没有健康检查，失败不会自动回滚。",
+      });
       appendAudit(auditPath, {
         host: host.name,
         tool: "ssh_deploy",
@@ -644,7 +748,19 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       if (policyOf(file).readonly) throw new PolicyDeniedError("只读模式拒绝回滚。");
       requireReason(host, "destructive", input.reason);
       if (input.file) {
-        await ask(input.ui, `${host.name}：恢复文件`, input.file);
+        await ask(input.ui, {
+          host: host.name,
+          action: "恢复文件",
+          danger: "destructive",
+          reason: input.reason,
+          summary: `把 ${input.file} 最近一次备份移回原位`,
+          command: `mv <最近一次备份> ${input.file}`,
+          lang: "bash",
+          notes: [
+            "查找位置：同目录 .bak.*，以及部署根内 .pi-ssh-backup/",
+            "找不到备份会报错并列出找过的位置",
+          ],
+        });
         const remote = await runnerFor(host);
         const quoted = shellQuote(input.file);
         // 备份可能在两个位置：部署根内的 <root>/.pi-ssh-backup/<rel>.<ts>，
@@ -681,11 +797,25 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       if (target.endsWith(".part")) throw new PolicyDeniedError(`${target} 是上传中的 .part 残留，不是发布目录，不能回滚到它。`);
       checkReleaseId(target);
       const releaseDir = `${plan.releasesDir}/${target}`;
-      await ask(input.ui, `${host.name}：回滚到 ${target}`, [
-        `${plan.currentLink} -> ${releaseDir}`,
-        restartCmd ? `重启：${restartCmd}` : "没有重启命令",
-        healthCmd ? "回滚后跑健康检查；不通过会报出两个版本的状态。" : "没有健康检查，回滚后不会自动验证。",
-      ].join("\n"));
+      await ask(input.ui, {
+        host: host.name,
+        action: `回滚到 ${target}`,
+        danger: "destructive",
+        reason: input.reason,
+        summary: `当前 ${current || "(未指向)"} → ${releaseDir}`,
+        command: [
+          `ln -sfn ${releaseDir} ${plan.currentLink}`,
+          restartCmd ? restartCmd : "# 没有重启命令",
+          healthCmd ? `# 健康检查：${healthCmd}` : "# 没有健康检查",
+        ].join("\n"),
+        lang: "bash",
+        notes: [
+          `重启：${restartCmd ? `\`${restartCmd}\`` : "无"}`,
+        ],
+        warning: healthCmd
+          ? "回滚后会跑健康检查；不通过会报出两个版本的状态，current 不会自动再切。"
+          : "没有健康检查，回滚后不会自动验证。",
+      });
       appendAudit(auditPath, {
         host: host.name,
         tool: "ssh_rollback",
@@ -716,11 +846,18 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       if (!Number.isInteger(input.listenPort) || input.listenPort < 0 || input.listenPort > 65535) {
         throw new PolicyDeniedError("listenPort 必须是 0 到 65535 的整数。0 表示由系统选空闲端口。");
       }
-      await ask(
-        input.ui,
-        `${host.name}：端口转发`,
-        `本机 127.0.0.1:${input.listenPort || "自动"} -> ${input.destHost}:${input.destPort}`,
-      );
+      await ask(input.ui, {
+        host: host.name,
+        action: "端口转发",
+        danger: "write",
+        summary: `${input.direction === "remote" ? "远端" : "本机"}回环 ${input.listenPort || "自动选端口"} → ${input.destHost}:${input.destPort}`,
+        command: `ssh -L 127.0.0.1:${input.listenPort || "<自动>"}:${input.destHost}:${input.destPort} ${host.user}@${host.host}`,
+        lang: "bash",
+        notes: [
+          "只监听 127.0.0.1，不对外网卡开放",
+          "会话结束自动关闭",
+        ],
+      });
       await connect(host);
       const opened = input.direction === "remote"
         ? await pool.tunnelRemote(host.id, input.listenPort, input.destHost, input.destPort)
