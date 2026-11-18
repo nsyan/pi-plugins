@@ -9,7 +9,7 @@ import neo4j, { Driver } from "neo4j-driver";
 import type { ConnConfig, DbConnection, ParsedTarget,
   ListTablesResult, DescribeTableResult, TableInfo, ColumnInfo } from "../core/types.js";
 import { GraphDialect, cellOf } from "./graph-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析：bolt(s|+s|+ssc):// 与 neo4j(s|+s|+ssc):// ────
 // neo4j:// 是集群路由 scheme（多主机 seed list 逗号分隔）；路径段 = database 名。
@@ -141,10 +141,6 @@ class Neo4jDialect extends GraphDialect {
   label = "Neo4j";
   family = "graph" as const;
   defaultPort = 7687;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^(bolt|neo4j)(\+s|\+ssc)?:\/\//],
-    configKeys: ["spring.neo4j.uri", "spring.data.neo4j.uri"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseNeo4jUrl(url);

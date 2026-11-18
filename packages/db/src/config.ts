@@ -1,8 +1,8 @@
 // config.ts —— 连接配置与插件配置读写（含旧文件名兼容 + mtime 内存缓存）
 // 注：本模块只做 JSON 文件 IO，不依赖任何 pi 运行时模块
-import { existsSync, readFileSync, writeFileSync, statSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, chmodSync, mkdirSync, renameSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { registry } from "./dialects/index.js";
 import type { ConnConfig, DbTypeId, TestConnectionResult } from "./core/types.js";
 
@@ -52,6 +52,22 @@ function readJsonCached<T>(file: string, fallback: T): T {
   } catch { return fallback; }
 }
 
+/**
+ * 原子写：tmp → chmod 0600 → rename。
+ * 直写原文件时，进程崩溃/磁盘满会留下截断的 JSON；下次读取解析失败若退化成空数组，
+ * 用户再保存一次就把所有连接覆盖掉。内容相同则跳过（避免无谓的 mtime 变动）。
+ */
+function writeFileAtomic(file: string, content: string, mode = 0o600): void {
+  if (existsSync(file)) {
+    try { if (readFileSync(file, "utf-8") === content) return; } catch { /* 读失败则继续覆盖 */ }
+  }
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, content, { mode });
+  try { chmodSync(tmp, mode); } catch { /* 平台不支持等场景容错 */ }
+  renameSync(tmp, file);
+}
+
 export function invalidateConfigCache(file?: string): void {
   if (file) caches.delete(file); else caches.clear();
 }
@@ -79,10 +95,28 @@ export function loadConfigs(): ConnConfig[] {
   return raw.map(migrateStored);
 }
 
+/**
+ * 严格读：文件存在但解析失败时抛错（而不是返回空数组）。
+ * `loadConfigs()` 的空数组无法区分「还没配」与「文件损坏」，而后者一旦被当成空列表，
+ * 用户随手保存一次就会把全部连接覆盖掉。所有会**写盘**的入口先走这里。
+ */
+export function loadConfigsStrict(): ConnConfig[] {
+  if (!existsSync(CONFIG_FILE)) return [];
+  const text = readFileSync(CONFIG_FILE, "utf-8");
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`${CONFIG_FILE} 不是合法 JSON（${err instanceof Error ? err.message : String(err)}）。为避免覆盖丢失连接，已中止写入；请先修复或备份该文件。`);
+  }
+  if (!Array.isArray(raw)) {
+    throw new Error(`${CONFIG_FILE} 顶层不是数组（实际为 ${typeof raw}）。为避免覆盖丢失连接，已中止写入；请先修复或备份该文件。`);
+  }
+  return raw.map(migrateStored);
+}
+
 export function saveConfigs(configs: ConnConfig[]): void {
-  writeFileSync(CONFIG_FILE, JSON.stringify(configs, null, 2));
-  // 降险（v1.1 UX 共识 Q4）：配置含明文密码，限制为仅当前用户可读写
-  try { chmodSync(CONFIG_FILE, 0o600); } catch { /* 只读文件系统等场景容错 */ }
+  writeFileAtomic(CONFIG_FILE, JSON.stringify(configs, null, 2));
   invalidateConfigCache(CONFIG_FILE);
 }
 
@@ -110,7 +144,7 @@ export function loadPluginConfig(): PluginConfig {
 }
 
 export function savePluginConfig(cfg: PluginConfig): void {
-  writeFileSync(PLUGIN_CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  writeFileAtomic(PLUGIN_CONFIG_FILE, JSON.stringify(cfg, null, 2));
   invalidateConfigCache(PLUGIN_CONFIG_FILE);
 }
 
@@ -170,13 +204,24 @@ export function parseConnectionString(input: string): ParsedConnectionString | n
 
 // ── 使用/测试记录（v1.1 UX 共识 Q1：连接列表摘要的数据源）───
 
-/** 回写最近使用时间（查询/列表/表结构成功后调用；找不到连接时静默跳过） */
+/** 回写最近使用时间（查询/列表/表结构成功后调用；找不到连接时静默跳过）
+ * 节流：同一连接 60 秒内只写一次。每次查询都全量重写含明文密码的 JSON，
+ * 高频查询下是纯写放大（写盘成本 + 丢更新风险），而「上次使用」的展示精度本来就是分钟级。*/
+const LAST_USED_WRITE_INTERVAL_MS = 60_000;
+const lastUsedWritten = new Map<string, number>();
+
 export function recordLastUsed(configName: string): void {
+  const now = Date.now();
+  const last = lastUsedWritten.get(configName);
+  if (last !== undefined && now - last < LAST_USED_WRITE_INTERVAL_MS) return;
   const all = loadConfigs();
   const c = all.find((x) => x.name === configName);
   if (!c) return;
-  c.lastUsedAt = new Date().toISOString();
-  saveConfigs(all);
+  c.lastUsedAt = new Date(now).toISOString();
+  try {
+    saveConfigs(all);
+    lastUsedWritten.set(configName, now);
+  } catch { /* 回写失败不影响查询主流程 */ }
 }
 
 /** 回写最近一次测试连接结果（测试连接/编辑后自动测试/向导建连成功时调用） */
@@ -185,7 +230,7 @@ export function recordTestResult(configName: string, r: TestConnectionResult): v
   const c = all.find((x) => x.name === configName);
   if (!c) return;
   c.lastTest = { ok: r.success, latency: r.latency, version: r.version, at: new Date().toISOString() };
-  saveConfigs(all);
+  try { saveConfigs(all); } catch { /* 同上 */ }
 }
 
 /** 相对时间文案：刚刚 / N 分钟前 / N 小时前 / N 天前 / YYYY-MM-DD */
@@ -245,7 +290,9 @@ export interface QueryExport {
   jsonPath: string;
 }
 
-/** 查询结果落盘 /tmp（CSV + JSON），返回路径；失败抛错由调用方容错 */
+/** 查询结果落盘 /tmp（CSV + JSON），返回路径；失败抛错由调用方容错。
+ * 权限 0600：导出内容是查询结果原文（可能含身份证号、手机号等），
+ * 与 db-configs.json 同等级别处理，不能落到默认 0644。*/
 export function writeQueryExport(
   columns: string[],
   rows: unknown[][],
@@ -255,8 +302,8 @@ export function writeQueryExport(
   const base = join(tmpdir(), `${baseName}-${stamp}`);
   const csvPath = `${base}.csv`;
   const jsonPath = `${base}.json`;
-  writeFileSync(csvPath, toCsv(columns, rows), "utf-8");
-  writeFileSync(jsonPath, JSON.stringify({ columns, rows }, null, 2), "utf-8");
+  writeFileSync(csvPath, toCsv(columns, rows), { encoding: "utf-8", mode: 0o600 });
+  writeFileSync(jsonPath, JSON.stringify({ columns, rows }, null, 2), { encoding: "utf-8", mode: 0o600 });
   return { csvPath, jsonPath };
 }
 

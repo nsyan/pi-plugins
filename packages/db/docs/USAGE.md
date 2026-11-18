@@ -159,14 +159,48 @@ SHOW INDEXES
 
 ## ✍️ 写操作：理由与审计
 
+### 读写判定（关系型 / 大数据家族：**读白名单**）
+
+v1.3.7 起不再是「写关键字黑名单」。只有下列开头算读，**白名单之外一律按写**（写要确认 + 附理由）：
+
+```
+SELECT …            WITH … SELECT …        SHOW …        DESCRIBE / DESC …
+EXPLAIN <SELECT>    VALUES …               TABLE …       HELP
+```
+
+读语句自带的副作用也按写收口：`SELECT … INTO OUTFILE` / `SELECT … INTO <表>`、`FOR UPDATE` / `FOR SHARE`、
+`EXPLAIN ANALYZE <DML>`，以及 `nextval()/pg_read_file()/lo_import()/dblink_exec()` 这类带服务端副作用的函数。
+
+改前的黑名单只认 15 个词，`COPY … FROM` / `COPY … TO PROGRAM` / `GRANT` / `SET` / `VACUUM` / `DO $$…$$` /
+`ATTACH DATABASE` / `COMMENT ON` / `USE` 等全部被判成读——只读模式会**直接执行**，写确认模式下**连确认框都不弹**。
+
+### 硬限制与高风险写
+
+| 类别 | 行为 |
+|---|---|
+| `DROP TABLE` / `DROP DATABASE` / `DROP SCHEMA` | **恒拒**，与只读开关和确认策略无关 |
+| DDL / 授权 / 会话设置 / 写文件 / 副作用函数（`CREATE`/`ALTER`/`DROP`/`TRUNCATE`/`GRANT`/`SET`/`COPY`/`DO`/`SELECT INTO` 等） | **高风险写**：即使确认策略设为「不确认」也会弹确认框 |
+| 普通 DML（`INSERT`/`UPDATE`/`DELETE`/`MERGE`） | 按确认策略：`never` 直执行、`write`/`always` 确认 |
+
+MongoDB 与 Neo4j 侧同理：只有普通 DML（`insert/update/delete/findAndModify/bulkWrite`、Cypher 的 `SET`/`REMOVE`/`DELETE`）
+在 `never` 策略下豁免确认，索引/用户/权限/重命名与未知命令一律按高风险。
+
+### 理由
+
 - AI 发起写操作必须附 `reason` 参数（动机 + 影响范围，如 *"将 status=2 的历史订单归档，预计影响 1.2 万行"*）
 - 确认框**首行展示理由**，执行结果末尾回显；缺失时拒绝并引导补充（与确认策略无关）
 - 弹窗里的 SQL 自动**格式化**（子句换行、逗号拆列、`AND`/`OR` 缩进、`CREATE TABLE` 长列定义块状展开）并按方言**语法高亮**（关系型/大数据/图 → SQL，MongoDB/Elasticsearch → JSON，Redis → 纯色代码块）；理由/摘要/库名用 **Markdown 排版**（引用块 + 加粗标签 + 行内代码 + emoji 图标）。TUI 走自定义弹窗（Enter 执行 / Esc 取消）；**pi web 走同一份 Markdown**（react-markdown + Prism 渲染，同样高亮，代码块带行号与复制按钮，正文可滚动）。弹窗尺寸由 pi-web 写死（560×760），内容过长靠正文滚动。美化只作用于展示，**实际执行的永远是原始语句**
-- 开启审计（`/db config → 审计日志`）后，写成功追加 `~/.pi/agent/db-audit/<YYYY-MM-DD>.jsonl`：
-  - 一天一个文件；字段含时间/项目路径/连接/摘要/理由/**完整 SQL 不截断**
-  - 文件 `0600`；审计失败静默降级，不阻断主流程
-  - 清理示例：`find ~/.pi/agent/db-audit -name "*.jsonl" -mtime +90 -delete`
+
+### 审计
+
+写操作审计写 `~/.pi/agent/db-audit/<YYYY-MM-DD>.jsonl`：
+
+- 一天一个文件；字段含时间/项目路径/连接/摘要/理由/**完整 SQL 不截断**；文件 `0600`
+- **生产连接（`envTag=prod`）与强制只读连接：恒写审计，且写盘失败则拒绝执行**（fail-closed）——这两类连接的写操作必须可追溯
+- 其余连接按 `/db config → 审计日志` 开关（默认关），失败静默降级不阻断主流程
+- `/db` 菜单里的「执行查询」与 AI 工具路径共用同一份审计（此前菜单执行完全无记录）
+- 清理示例：`find ~/.pi/agent/db-audit -name "*.jsonl" -mtime +90 -delete`
 
 ## 💾 查询结果导出
 
-结果超过 50 行时自动导出 `/tmp`（CSV + JSON 双格式），只回文件路径；达到 `max_rows` 截断时有明确标注。
+结果超过 50 行时自动导出 `/tmp`（CSV + JSON 双格式，权限 `0600`），只回文件路径；达到 `max_rows` 截断时有明确标注。

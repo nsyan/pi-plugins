@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registry } from "./src/dialects/index.js";
-import { decide, effectiveReadonly, writeRequiresReason } from "./src/core/policy.js";
+import { decide, effectiveReadonly, writeRequiresReason, auditRequired } from "./src/core/policy.js";
 import { appendAuditLog } from "./src/core/audit.js";
 import { collectTree } from "./src/core/scan/tree.js";
 import { MAX_DEPTH } from "./src/core/scan/walker.js";
@@ -10,7 +10,7 @@ import { validateCandidates } from "./src/core/scan/validate.js";
 import { TRUST_GLYPH, TRUST_LABEL } from "./src/core/scan/trust.js";
 import type { Candidate, ConnConfig, DbTypeId } from "./src/core/types.js";
 import {
-  loadConfigs, saveConfigs, loadPluginConfig, savePluginConfig, getConfigSummary,
+  loadConfigs, loadConfigsStrict, saveConfigs, loadPluginConfig, savePluginConfig, getConfigSummary,
   findConfig, toRuntimeConfig, shortTypeLabel, fullTypeLabel,
   parseConnectionString, getDefaultConfig, setDefaultConfig, writeQueryExport,
   recordLastUsed, recordTestResult, connSummaryLine, envTagLabel, formatRelativeTime,
@@ -98,8 +98,7 @@ function buildDbListHint(configs: ConnConfig[], cfg: PluginConfig): string {
       : cfg.confirm_before_exec === "write"
         ? "当前执行确认：写操作确认。写操作执行前会弹出确认框。"
         : "当前执行确认：每次都确认。每条 SQL 执行前都会弹出确认框。";
-  const safety = "DROP TABLE 始终禁止通过 query_database 执行，与 AI 只读模式设置无关。";
-
+  const safety = "DROP TABLE / DATABASE / SCHEMA 始终禁止通过 query_database 执行，与 AI 只读模式设置无关；其余 DDL、授权、会话设置属于高风险写，即使确认策略设为「不确认」也会弹确认框。";
   if (configs.length === 0) {
     return [
       "[数据库工具执行策略]",
@@ -122,6 +121,7 @@ function buildDbListHint(configs: ConnConfig[], cfg: PluginConfig): string {
     confirmation,
     safety,
     "标注 [prod·强制只读] 的连接无论全局只读设置如何均只允许查询。",
+    "关系型/大数据方言按**读白名单**判定：只有 SELECT/WITH…SELECT/SHOW/DESCRIBE/DESC/EXPLAIN(SELECT)/VALUES/TABLE 算读，白名单之外一律按写（写语句要确认+理由）。",
     "[可用数据库]",
     ...lines,
     "query_database / list_tables / describe_table 的 database 参数必须使用上述名称（不含中括号内容，名称区分大小写）。",
@@ -147,6 +147,57 @@ function candidateLine(c: Candidate): string {
 function sessionCwdOf(ctx: any): string | null {
   const cwd = ctx?.cwd;
   return typeof cwd === "string" && cwd ? cwd : null;
+}
+
+/**
+ * 写操作审计（fail-closed）：工具路径与 /db 菜单路径共用。
+ * - 普通连接：`audit_enabled` 控制是否落盘，失败静默降级（不阻断查询）。
+ * - 生产/强制只读连接：**恒写**，且落盘失败则拒绝执行——「可追溯」是这两类连接的前提。
+ * @returns 错误信息（应拒绝执行时）或 undefined
+ */
+function auditWrite(input: {
+  cfg: PluginConfig;
+  config: ConnConfig;
+  summary?: string;
+  reason?: string;
+  sql: string;
+  readonly: boolean;
+  ctx?: any;
+}): string | undefined {
+  const { cfg, config, summary, reason, sql, readonly, ctx } = input;
+  const required = auditRequired(config);
+  if (!required && !cfg.audit_enabled) return undefined;
+  const ok = appendAuditLog({
+    time: new Date().toISOString(),
+    project: sessionCwdOf(ctx) ?? "(会话目录未知)",
+    connection: config.name,
+    type: config.type,
+    summary: summary ?? "",
+    reason: (reason ?? "").trim(),
+    sql,
+    readonly,
+  });
+  if (ok) return undefined;
+  if (required) {
+    return `审计日志写入失败，已拒绝执行。连接 ${config.name} 标记为${config.envTag === "prod" ? "生产环境" : "强制只读"}，其写操作必须可追溯。请检查 ~/.pi/agent/db-audit 的写权限后重试。`;
+  }
+  return undefined;
+}
+
+/** 写盘前的严格读取：配置文件损坏时提示并中止，绝不把「空列表」写回去覆盖原有连接。
+ * 所有会改动 db-configs.json 的路径都必须过这里。
+ */
+function loadForWrite(ctx: any): ConnConfig[] | null {
+  try {
+    return loadConfigsStrict();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // ctx.ui 可能缺失（工具路径/宿主差异）——报错提示不能因为没 UI 而变成 TypeError，
+    // 那会把「配置文件损坏」这个真正原因掩盖成「Cannot read properties of undefined」
+    if (typeof ctx?.ui?.notify === "function") ctx.ui.notify(msg, "error");
+    else console.error(`[db] ${msg}`);
+    return null;
+  }
 }
 
 // ── 导出扩展 ──────────────────────────────────────
@@ -207,7 +258,8 @@ export default function (pi: ExtensionAPI) {
       return "failed";
     }
     ctx.ui.notify(`连接成功 (${result.version ?? ""}${result.warning ? "，警告: " + result.warning : ""}, ${result.latency})`, "success");
-    const all = loadConfigs();
+    const all = loadForWrite(ctx);
+    if (!all) return "failed";
     const idx = all.findIndex((x) => x.name === name);
     if (idx >= 0) all[idx] = conn; else all.push(conn);
     saveConfigs(all);
@@ -246,7 +298,8 @@ export default function (pi: ExtensionAPI) {
         lastTest: undefined,
         createdAt: new Date().toISOString(),
       };
-      const all = loadConfigs();
+      const all = loadForWrite(ctx);
+      if (!all) return;
       all.push(copy);
       saveConfigs(all);
       ctx.ui.notify(`已复制为 ${newName}（类型/账号/环境标签等设置一并带上）`, "success");
@@ -341,7 +394,8 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const configs = loadConfigs();
+    const configs = loadForWrite(ctx);
+    if (!configs) return;
     if (configs.some((c) => c.name === name)) {
       ctx.ui.notify(`已存在同名配置: ${name}`, "error");
       return;
@@ -437,7 +491,8 @@ export default function (pi: ExtensionAPI) {
       description,
     };
 
-    const all = loadConfigs();
+    const all = loadForWrite(ctx);
+    if (!all) return;
     if (updated.name !== original.name && all.some((c) => c.id !== original.id && c.name === updated.name)) {
       ctx.ui.notify(`已存在同名配置: ${updated.name}`, "error");
       return;
@@ -491,7 +546,8 @@ export default function (pi: ExtensionAPI) {
     if (!target) return;
     const ok = await ctx.ui.confirm("确认删除", `确定删除数据库连接 ${target.name}？`);
     if (!ok) return;
-    const all = loadConfigs();
+    const all = loadForWrite(ctx);
+    if (!all) return;
     saveConfigs(all.filter((c) => c.id !== target.id));
     ctx.ui.notify(`已删除: ${target.name}`, "success");
   };
@@ -514,7 +570,8 @@ export default function (pi: ExtensionAPI) {
     if (!choice || choice === "← 返回") return;
 
     if (choice.startsWith("⭐")) {
-      const all = loadConfigs();
+      const all = loadForWrite(ctx);
+      if (!all) return;
       saveConfigs(setDefaultConfig(all, config.isDefault ? "" : config.id));
       ctx.ui.notify(config.isDefault ? `已取消默认: ${config.name}` : `已设为默认: ${config.name}`, "success");
       return;
@@ -525,7 +582,7 @@ export default function (pi: ExtensionAPI) {
       const dialect = registry.get(config.type)!;
       const effRo = effectiveReadonly(cfg.ai_readonly, config); // 连接级强制只读生效（v1.2 Q3）
       const verdict = dialect.isAllowed(sql, effRo);
-      const action = decide(verdict, effRo, cfg.confirm_before_exec);
+      const action = decide(verdict, effRo, cfg.confirm_before_exec, verdict.highRisk === true);
       if (action === "deny") {
         ctx.ui.notify(`不允许执行: ${verdict.reason}`, "error");
         continue;
@@ -534,9 +591,18 @@ export default function (pi: ExtensionAPI) {
         const ok = await confirmSqlExecution(ctx, {
           summary: verdict.summary,
           sql,
+          database: config.name,
           type: config.type,
         });
         if (!ok) continue;
+      }
+      // 菜单路径与工具路径共用同一份审计（此前菜单执行完全无审计）
+      if (verdict.isWrite) {
+        const denied = auditWrite({
+          cfg, config, summary: verdict.summary, reason: "（/db 菜单执行，未填理由）",
+          sql, readonly: effRo, ctx,
+        });
+        if (denied) { ctx.ui.notify(denied, "error"); continue; }
       }
       ctx.ui.notify("正在执行查询...", "info");
       const result = await dialect.executeOn(toRuntimeConfig(config, dialect.defaultPort), sql, {
@@ -610,7 +676,8 @@ export default function (pi: ExtensionAPI) {
     } else if (choice === "🗑️ 删除") {
       const ok = await ctx.ui.confirm("确认删除", `确定删除数据库连接 ${config.name}？`);
       if (!ok) continue;
-      const all = loadConfigs();
+      const all = loadForWrite(ctx);
+      if (!all) continue;
       saveConfigs(all.filter((c) => c.id !== config.id));
       ctx.ui.notify(`已删除: ${config.name}`, "success");
       return;
@@ -751,7 +818,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "query_database",
     label: "数据库查询",
-    description: "执行语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / MongoDB / Neo4j / Hive / Spark 十种数据库，返回执行结果。支持读和写，写操作受确认策略约束且必须附 reason 执行理由（动机+影响范围），用户确认框将展示该理由；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE 始终禁止。MongoDB 的 sql 参数填 JSON 命令信封（db.runCommand 形态，如 {\"find\":\"users\",\"filter\":{}}）；Neo4j 填 Cypher（如 MATCH (n:Person) RETURN n LIMIT 10）。",
+    description: "执行语句，支持关系型（PostgreSQL/MySQL/Oracle/达梦）/ Redis / Elasticsearch / MongoDB / Neo4j / Hive / Spark 十种数据库，返回执行结果。支持读和写，写操作受确认策略约束且必须附 reason 执行理由（动机+影响范围），用户确认框将展示该理由；是否允许写以及是否需确认，以系统提示中的当前数据库工具执行策略为准。DROP TABLE/DATABASE/SCHEMA 始终禁止；其余 DDL、授权、会话设置属于高风险写，即使确认策略为「不确认」也会确认。MongoDB 的 sql 参数填 JSON 命令信封（db.runCommand 形态，如 {\"find\":\"users\",\"filter\":{}}）；Neo4j 填 Cypher（如 MATCH (n:Person) RETURN n LIMIT 10）。",
     promptSnippet: "执行 SQL 语句。先根据系统提示中的当前数据库工具执行策略判断是否允许写操作；写操作必须在 reason 参数说明动机与影响范围（如\"将status=2的历史订单归档，预计影响1.2万行\"），否则会被拒绝。database 参数取系统提示「可用数据库」列表中的名称（缺省走默认连接）。使用 list_tables 查看表结构后再编写 SQL。",
     parameters: Type.Object({
       database: Type.Optional(Type.String({ description: "数据库连接名称（取系统提示「可用数据库」列表中的名称；缺省走默认连接）" })),
@@ -781,7 +848,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
       const verdict = dialect.isAllowed(params.sql, effectiveReadOnly);
-      const action = decide(verdict, effectiveReadOnly, cfg.confirm_before_exec);
+      const action = decide(verdict, effectiveReadOnly, cfg.confirm_before_exec, verdict.highRisk === true);
       if (action === "deny") {
         const note = !cfg.ai_readonly && config.forceReadonly === true
           ? `（连接 ${config.name} 已设置强制只读）`
@@ -817,6 +884,17 @@ export default function (pi: ExtensionAPI) {
         // 用户确认，继续执行
       }
 
+      // 写操作审计：生产/强制只读连接**先落盘再执行**（fail-closed），普通连接按 audit_enabled
+      if (verdict.isWrite) {
+        const denied = auditWrite({
+          cfg, config, summary: verdict.summary, reason: params.reason,
+          sql: params.sql, readonly: effectiveReadOnly, ctx,
+        });
+        if (denied) {
+          return { details: undefined, content: [{ type: "text" as const, text: denied }] };
+        }
+      }
+
       const result = await dialect.executeOn(
         toRuntimeConfig(config, dialect.defaultPort),
         params.sql,
@@ -830,19 +908,6 @@ export default function (pi: ExtensionAPI) {
       }
 
       recordLastUsed(config.name);
-      // 写操作审计（v1.1 UX 共识 Q4 + 可配置修订：默认关闭，cfg.audit_enabled 开启才落盘；失败不阻断主流程）
-      if (verdict.isWrite && cfg.audit_enabled) {
-        appendAuditLog({
-          time: new Date().toISOString(),
-          project: sessionCwdOf(ctx) ?? "(会话目录未知)",
-          connection: config.name,
-          type: config.type,
-          summary: verdict.summary ?? "",
-          reason: (params.reason ?? "").trim(),
-          sql: params.sql,
-          readonly: effectiveReadOnly,
-        });
-      }
       let text = `查询完成 (${result.duration})，返回 ${result.rowCount} 行\n`;
       if (result.columns && result.columns.length > 0) {
         text += `列: ${result.columns.join(", ")}\n\n`;
@@ -1139,8 +1204,11 @@ export default function (pi: ExtensionAPI) {
               if (target.isDefault) {
                 ctx.ui.notify(`已是默认连接: ${target.name}`, "info");
               } else {
-                saveConfigs(setDefaultConfig(configsNow, target.id));
-                ctx.ui.notify(`默认连接已切换: ${target.name}`, "success");
+                const fresh = loadForWrite(ctx);
+                if (fresh) {
+                  saveConfigs(setDefaultConfig(fresh, target.id));
+                  ctx.ui.notify(`默认连接已切换: ${target.name}`, "success");
+                }
               }
             }
           }

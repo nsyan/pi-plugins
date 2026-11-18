@@ -3,7 +3,7 @@ import pg from "pg";
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   ListTablesResult, DescribeTableResult } from "../core/types.js";
 import { RelationalDialect } from "./relational-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析（JDBC + 原生 URI 双形态，Spec §7）───
 
@@ -41,10 +41,6 @@ class PostgresqlDialect extends RelationalDialect {
   label = "PostgreSQL";
   family = "relational" as const;
   defaultPort = 5432;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^jdbc:postgresql:\/\//, /^postgresql:\/\//],
-    configKeys: ["spring.datasource.url"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parsePostgresUrl(url);
@@ -54,13 +50,16 @@ class PostgresqlDialect extends RelationalDialect {
     return `jdbc:postgresql://${config.host}:${config.port}/${config.database}`;
   }
 
-  protected async doConnect(config: ConnConfig, _timeoutMs: number): Promise<DbConnection> {
+  protected async doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection> {
+    // connectionTimeoutMillis：内网防火墙丢包时不让 TCP 默认超时（分钟级）把会话挂死
     const client = new pg.Client({
       host: config.host,
       port: config.port,
       user: config.username,
       password: config.password,
       database: config.database,
+      connectionTimeoutMillis: timeoutMs,
+      query_timeout: timeoutMs,
     });
     await client.connect();
     return {

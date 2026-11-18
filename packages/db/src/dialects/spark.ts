@@ -7,7 +7,7 @@ import * as hive from "hive-driver";
 import type { ConnConfig, DbConnection, ParsedTarget,
   DescribeTableResult, ColumnInfo } from "../core/types.js";
 import { BigDataDialect, type Hs2Session } from "./bigdata-dialect.js";
-import { register, type Fingerprints } from "./dialect.js";
+import { register } from "./dialect.js";
 
 const HIVE2_RE = /^jdbc:hive2:\/\/([^:/?#]+)(?::(\d+))?\/([^?#]*)$/;
 const DEFAULT_PORT = 10000; // Spark Thrift Server 默认 10000（部分发行版 10015，可配）
@@ -41,13 +41,8 @@ class SparkDialect extends BigDataDialect {
   label = "Spark";
   family = "bigdata" as const;
   defaultPort = DEFAULT_PORT;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^jdbc:hive2:\/\//],
-    configKeys: ["spring.datasource.url"],
-  };
   // Hive 集 + SparkSQL 特有：CACHE|REFRESH|UNCACHE
   protected writeKeywords = /\b(INSERT\s+(INTO|OVERWRITE)|CREATE\s+TABLE(\s+AS)?|LOAD\s+DATA|MSCK|ALTER|DROP|CACHE\s+TABLE|UNCACHE\s+TABLE|REFRESH(\s+TABLE|\s+RESOURCE|\s+CACHE)?)\b/i;
-  protected sessionPrefix = "spark.";
 
   parseUrl(url: string): ParsedTarget | null {
     return parseSparkUrl(url);

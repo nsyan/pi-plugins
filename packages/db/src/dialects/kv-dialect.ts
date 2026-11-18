@@ -2,7 +2,7 @@
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   QueryResult } from "../core/types.js";
 import { matchCommand } from "../core/whitelist.js";
-import type { Dialect, Verdict, Fingerprints } from "./dialect.js";
+import type { Dialect, Verdict } from "./dialect.js";
 
 // ── 命令切分（空白 + 双引号）───
 // 注：Redis 无分号语句概念，sql 整体视为一条命令
@@ -43,12 +43,18 @@ const READ_CMDS = [
 // ── 恒拒命令（与只读开关无关；CONFIG 一刀切含 CONFIG GET，有意从紧）───
 const DENY_ALWAYS = ["FLUSHALL", "FLUSHDB", "CONFIG", "SHUTDOWN", "SLAVEOF", "REPLICAOF", "DEBUG"];
 
+/** 高风险写（不可回滚/影响面不可预估）：confirm_before_exec=never 不豁免 */
+const HIGH_RISK_CMDS = [
+  "EVAL", "EVALSHA", "EVAL_RO", "FCALL", "FCALL_RO", "SCRIPT", "FUNCTION",
+  "RESTORE", "MIGRATE", "SWAPDB", "MOVE", "CLUSTER", "ACL", "MODULE", "FAILOVER",
+  "SETEX", "PSETEX", "MSET", "MSETNX", "DEL", "UNLINK", "RENAME", "RENAMENX",
+];
+
 export abstract class KvDialect implements Dialect {
   abstract id: Dialect["id"];
   abstract label: string;
   abstract family: Dialect["family"];
   abstract defaultPort: number;
-  abstract fingerprints: Fingerprints;
   abstract parseUrl(url: string): ParsedTarget | null;
   abstract displayUrl(config: ConnConfig): string;
   abstract versionQuery(conn: DbConnection): Promise<string>;
@@ -71,7 +77,7 @@ export abstract class KvDialect implements Dialect {
     if (readonly) {
       return { ok: false, reason: `只读模式下不允许执行写命令：${cmd}`, isWrite: true, summary };
     }
-    return { ok: true, isWrite: true, summary };
+    return { ok: true, isWrite: true, highRisk: matchCommand(cmd, HIGH_RISK_CMDS), summary };
   }
 
   async executeOn(config: ConnConfig, sql: string, opts: ExecOpts): Promise<QueryResult> {

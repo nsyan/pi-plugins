@@ -3,7 +3,7 @@
 
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   QueryResult } from "../core/types.js";
-import type { Dialect, Verdict, Fingerprints } from "./dialect.js";
+import type { Dialect, Verdict } from "./dialect.js";
 
 // ── DSL 解封（Spec §4.3 DSL 信封约定）───
 // JSON 顶层 key 映射端点：query/count→读（_search/_count）；mget/mget_docs→读（_mget）；
@@ -77,7 +77,6 @@ export abstract class SearchDialect implements Dialect {
   abstract label: string;
   abstract family: Dialect["family"];
   abstract defaultPort: number;
-  abstract fingerprints: Fingerprints;
   abstract parseUrl(url: string): ParsedTarget | null;
   abstract displayUrl(config: ConnConfig): string;
   abstract versionQuery(conn: DbConnection): Promise<string>;
@@ -108,6 +107,7 @@ export abstract class SearchDialect implements Dialect {
       ok: false,
       reason: `ES 方言仅支持读查询（_search/_count/_mget），写端点不支持：${kind.endpoint}`,
       isWrite: true,
+      highRisk: true,
       summary,
     };
   }

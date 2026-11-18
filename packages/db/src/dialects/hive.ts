@@ -9,7 +9,7 @@ import * as hive from "hive-driver";
 import type { ConnConfig, DbConnection, ParsedTarget,
   DescribeTableResult, ColumnInfo } from "../core/types.js";
 import { BigDataDialect, type Hs2Session } from "./bigdata-dialect.js";
-import { register, type Fingerprints } from "./dialect.js";
+import { register } from "./dialect.js";
 
 // ── URL 解析：jdbc:hive2://host:port/database（默认端口 10000）───
 const HIVE2_RE = /^jdbc:hive2:\/\/([^:/?#]+)(?::(\d+))?\/([^?#]*)$/;
@@ -44,13 +44,8 @@ class HiveDialect extends BigDataDialect {
   label = "Hive";
   family = "bigdata" as const;
   defaultPort = DEFAULT_PORT;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^jdbc:hive2:\/\//],
-    configKeys: ["spring.datasource.url"],
-  };
   // Task 1 WRITE_RE 已含 MSCK|CACHE|REFRESH；家族集补 HiveQL 特有写形态
   protected writeKeywords = /\b(INSERT\s+(INTO|OVERWRITE)|CREATE\s+TABLE(\s+AS)?|LOAD\s+DATA|MSCK|ALTER|DROP)\b/i;
-  protected sessionPrefix = "hive.";
 
   parseUrl(url: string): ParsedTarget | null {
     return parseHiveUrl(url);

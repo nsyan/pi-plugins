@@ -67,13 +67,14 @@ pi install ./packages/db     # 本仓库开发者
 
 | 机制 | 行为 |
 |------|------|
-| AI 只读模式 | **默认开**；关闭后允许写 |
+| AI 只读模式 | **默认开**；关闭后允许写。判定为**读白名单**：只有 `SELECT`/`WITH…SELECT`/`SHOW`/`DESCRIBE`/`EXPLAIN <SELECT>`/`VALUES`/`TABLE` 算读，白名单之外一律按写 |
 | 写确认 | 写操作弹框展示：理由 + 命令摘要 + SQL（自动格式化 + 按方言语法高亮） |
 | 写执行理由 | AI 必须附 `reason`（动机+影响范围），缺失直接拒绝 |
+| 高风险写 | DDL / 授权 / 会话设置 / 写文件 / 副作用函数（`CREATE`/`ALTER`/`DROP`/`TRUNCATE`/`GRANT`/`SET`/`COPY`/`DO`/`SELECT INTO`…）即使确认策略设为「不确认」**也会弹框** |
 | 连接级强制只读 | 标记的连接（如生产库）无视全局开关，永远只读 |
-| 家族白名单 | Redis/ES/Mongo 只读白名单；`DROP`、管理 DDL、服务端 JS、`CALL dbms.*` 恒拒 |
-| 审计日志 | 默认关；`/db config` 开启后写操作按天落盘（完整 SQL，0600） |
-| 凭据 | 配置文件 `0600`；扫描场景密码经确认框补录（v1.3 起随 AI 阅读进会话，用户知情接受） |
+| 硬限制 | `DROP TABLE/DATABASE/SCHEMA` 恒拒；Redis `FLUSHALL`/`CONFIG`/`SHUTDOWN` 恒拒；ES `DELETE <index>` 与写端点恒拒；Mongo 管理 DDL 与服务端 JS 恒拒；Neo4j `CALL dbms.*` 恒拒 |
+| 审计日志 | 默认关；`/db config` 开启后写操作按天落盘（完整 SQL，0600）。**生产连接（`envTag=prod`）与强制只读连接恒写，且写盘失败则拒绝执行** |
+| 凭据 | 配置文件 `0600`（原子写：tmp → chmod → rename，内容未变跳过）；配置文件损坏时写盘路径抛错而非当成空列表，避免保存一次丢光连接；导出结果同 `0600` |
 | 扫描越界 | `path` 相对会话工作目录（`ctx.cwd`）解析，按**真实路径（realpath）**判定：`..` 上跳、绝对路径、仓库内指向子树外的软链（如 `dbconf -> /etc`）一律拒绝；`ctx.cwd` 缺失时 fail-closed，绝不回落到宿主进程目录 |
 
 ## ⚙️ 设置

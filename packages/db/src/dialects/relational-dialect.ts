@@ -1,15 +1,14 @@
 // src/dialects/relational-dialect.ts
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget } from "../core/types.js";
 import type { QueryResult } from "../core/types.js";
-import { splitStatements, isWriteStatement, isDropStatement } from "../core/sql-text.js";
-import type { Dialect, Verdict, Fingerprints } from "./dialect.js";
+import { splitStatements, isWriteStatement, isDropStatement, isHighRiskStatement, writeReasonOf } from "../core/sql-text.js";
+import type { Dialect, Verdict } from "./dialect.js";
 
 export abstract class RelationalDialect implements Dialect {
   abstract id: Dialect["id"];
   abstract label: string;
   abstract family: Dialect["family"];
   abstract defaultPort: number;
-  abstract fingerprints: Fingerprints;
   abstract parseUrl(url: string): ParsedTarget | null;
   abstract displayUrl(config: ConnConfig): string;
   abstract versionQuery(conn: DbConnection): Promise<string>;
@@ -40,12 +39,14 @@ export abstract class RelationalDialect implements Dialect {
     if (readonly) {
       for (const s of stmts) {
         if (isWriteStatement(s)) {
-          return { ok: false, reason: `只读模式下不允许执行非查询语句：${s.slice(0, 80)}`, isWrite: true, summary };
+          const why = writeReasonOf(s) ?? "非查询语句";
+          return { ok: false, reason: `只读模式下不允许执行非查询语句（${why}）：${s.slice(0, 80)}`, isWrite: true, summary };
         }
       }
     }
     const isWrite = stmts.some(isWriteStatement);
-    return { ok: true, isWrite, summary };
+    const highRisk = isWrite && stmts.some((s) => isWriteStatement(s) && isHighRiskStatement(s));
+    return { ok: true, isWrite, highRisk, summary };
   }
 
   async executeOn(config: ConnConfig, sql: string, opts: ExecOpts): Promise<QueryResult> {

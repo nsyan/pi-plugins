@@ -3,7 +3,7 @@ import Redis from "ioredis";
 import type { ConnConfig, DbConnection, ParsedTarget,
   ListTablesResult, DescribeTableResult, TableInfo } from "../core/types.js";
 import { KvDialect } from "./kv-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析：redis(s)://[:password@]host:port[/db] ───
 const REDIS_RE = /^(rediss?):\/\/(?:[^/@]*@)?([^:/?#@]+)(?::(\d+))?(?:\/(\d+))?$/;
@@ -34,10 +34,6 @@ class RedisDialect extends KvDialect {
   label = "Redis";
   family = "kv" as const;
   defaultPort = 6379;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^rediss?:\/\//],
-    configKeys: ["spring.data.redis.host", "spring.redis.host", "redisson.address"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseRedisUrl(url);

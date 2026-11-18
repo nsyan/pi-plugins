@@ -3,7 +3,7 @@ import mysql from "mysql2/promise";
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   ListTablesResult, DescribeTableResult, ColumnInfo } from "../core/types.js";
 import { RelationalDialect } from "./relational-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析（JDBC + 原生 URI 双形态，Spec §7）───
 
@@ -41,10 +41,6 @@ class MysqlDialect extends RelationalDialect {
   label = "MySQL";
   family = "relational" as const;
   defaultPort = 3306;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^jdbc:mysql:\/\//, /^mysql:\/\//],
-    configKeys: ["spring.datasource.url"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseMysqlUrl(url);
@@ -54,7 +50,7 @@ class MysqlDialect extends RelationalDialect {
     return `jdbc:mysql://${config.host}:${config.port}/${config.database}`;
   }
 
-  protected async doConnect(config: ConnConfig, _timeoutMs: number): Promise<DbConnection> {
+  protected async doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection> {
     const conn = await mysql.createConnection({
       host: config.host,
       port: config.port,
@@ -62,6 +58,7 @@ class MysqlDialect extends RelationalDialect {
       password: config.password,
       database: config.database,
       charset: "utf8mb4",
+      connectTimeout: timeoutMs, // 内网丢包时不让 TCP 默认超时把会话挂死
     });
     return {
       type: "mysql",

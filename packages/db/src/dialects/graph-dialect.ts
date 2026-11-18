@@ -5,7 +5,7 @@
 
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   QueryResult } from "../core/types.js";
-import type { Dialect, Verdict, Fingerprints } from "./dialect.js";
+import type { Dialect, Verdict } from "./dialect.js";
 import { stripComments, splitStatements } from "../core/sql-text.js";
 
 // ── Cypher 读写分类（本家族管控核心，Spec 共识：关键字白名单 + 保守兜底）──────
@@ -28,6 +28,9 @@ const SHOW_CATEGORIES = /^(INDEX(?:ES)?|CONSTRAINT(?:S)?|PROCEDURES?|FUNCTIONS?|
 //     CALL {} 子查询本身不算写——子查询内的写关键字会被扫到，纯读子查询放行 */
 const WRITE_KEYWORD_RE =
   /(?<![\w.$`])(?:CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|FOREACH|TERMINATE)(?![\w$`])|LOAD\s+CSV/i;
+
+/** 高风险写：schema/约束/索引与批量删除不可回滚，confirm_before_exec=never 不豁免 */
+const HIGH_RISK_RE = /(?<![\w.$`])(?:CREATE|DROP|MERGE|DETACH|FOREACH|TERMINATE)(?![\w$`])|LOAD\s+CSV/i;
 
 /** 剥离字符串字面量（' "）与反引号标识符内容，防止值内写词误判 */
 function stripLiterals(text: string): string {
@@ -66,19 +69,19 @@ export function classifyStatement(stmt: string): Verdict {
   }
   // 3) 任意深度写关键字 → 按写（含 MATCH ... DELETE、FOREACH 内写、CALL {} 子查询写）
   const isWrite = WRITE_KEYWORD_RE.test(text);
-  if (isWrite) return { ok: true, isWrite: true, summary };
+  if (isWrite) return { ok: true, isWrite: true, highRisk: HIGH_RISK_RE.test(text), summary };
   // 4) CALL 过程：扫描全部过程名，任一不在白名单 → 保守按写
   //    （apoc.* 无法安全区分读写，统一走写确认；dbms.* 已在步骤 1 恒拒）
   const procs = [...text.matchAll(/\bCALL\s+([\w.]+)/gi)].map((m) => m[1].toLowerCase());
   if (procs.length > 0) {
     if (procs.every((p) => READ_PROCEDURES.has(p))) return { ok: true, isWrite: false, summary };
-    return { ok: true, isWrite: true, summary: `${summary}（未知过程，按写）` };
+    return { ok: true, isWrite: true, highRisk: true, summary: `${summary}（未知过程，按写）` };
   }
   // 5) 已知读开头（MATCH/OPTIONAL/RETURN/WITH/UNWIND）→ 读；其余未知保守按写
   if (/^\s*(MATCH|OPTIONAL|RETURN|WITH|UNWIND)\b/i.test(text)) {
     return { ok: true, isWrite: false, summary };
   }
-  return { ok: true, isWrite: true, summary: `${summary}（未知语句，按写）` };
+  return { ok: true, isWrite: true, highRisk: true, summary: `${summary}（未知语句，按写）` };
 }
 
 /** 多语句分类：任一写 → 整体按写；任一恒拒 → 整体拒绝 */
@@ -88,14 +91,16 @@ export function classifyCypher(sql: string): Verdict {
     return { ok: false, reason: "Cypher 语句不能为空，如 MATCH (n:Person) RETURN n LIMIT 10" };
   }
   let anyWrite = false;
+  let anyHighRisk = false;
   const parts: string[] = [];
   for (const s of stmts) {
     const v = classifyStatement(s);
     if (!v.ok) return v;
     if (v.isWrite) anyWrite = true;
+    if (v.highRisk) anyHighRisk = true;
     if (v.summary) parts.push(v.summary);
   }
-  return { ok: true, isWrite: anyWrite, summary: stmts.length > 1 ? `${stmts.length} 条语句` : parts[0] ?? "" };
+  return { ok: true, isWrite: anyWrite, highRisk: anyWrite && anyHighRisk, summary: stmts.length > 1 ? `${stmts.length} 条语句` : parts[0] ?? "" };
 }
 
 // ── 结果拍平（Record → 行；Node/Relationship/Path 等 graph 类型转展示原语）───
@@ -153,7 +158,6 @@ export abstract class GraphDialect implements Dialect {
   abstract label: string;
   abstract family: Dialect["family"];
   abstract defaultPort: number;
-  abstract fingerprints: Fingerprints;
   abstract parseUrl(url: string): ParsedTarget | null;
   abstract displayUrl(config: ConnConfig): string;
   abstract versionQuery(conn: DbConnection): Promise<string>;

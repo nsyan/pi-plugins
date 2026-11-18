@@ -2,15 +2,20 @@
 import type { ConnConfig, ParsedTarget, DbConnection, ExecOpts, DbTypeId, DbFamily,
   QueryResult, ListTablesResult, DescribeTableResult, TestConnectionResult } from "../core/types.js";
 
-export interface Fingerprints { urlPatterns: RegExp[]; configKeys: string[]; }
-export interface Verdict { ok: boolean; reason?: string; isWrite?: boolean; summary?: string; }
+export interface Verdict {
+  ok: boolean;
+  reason?: string;
+  isWrite?: boolean;
+  /** 高风险写（DDL/授权/会话设置/写文件）：确认策略 never 不豁免 */
+  highRisk?: boolean;
+  summary?: string;
+}
 
 export interface Dialect {
   id: DbTypeId;
   label: string;
   family: DbFamily;
   defaultPort: number;
-  fingerprints: Fingerprints;
   parseUrl(url: string): ParsedTarget | null;
   withConnection<T>(config: ConnConfig, fn: (conn: DbConnection) => Promise<T>, timeoutMs?: number): Promise<T>;
   testConnection(config: ConnConfig): Promise<TestConnectionResult>;

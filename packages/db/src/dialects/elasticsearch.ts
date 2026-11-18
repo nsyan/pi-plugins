@@ -5,7 +5,7 @@ import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   TestConnectionResult, ListTablesResult, DescribeTableResult,
   TableInfo, ColumnInfo } from "../core/types.js";
 import { SearchDialect, type DslKind } from "./search-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析：http(s)://[user:pass@]host:port（认证解出后归一化到 username/password，API Key 二期）───
 const ES_RE = /^(https?):\/\/(?:([^:/?#@]*)(?::([^@]*))?@)?([^:/?#@]+)(?::(\d+))?(\/.*)?$/;
@@ -73,10 +73,6 @@ class ElasticsearchDialect extends SearchDialect {
   label = "Elasticsearch";
   family = "search" as const;
   defaultPort = 9200;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^https?:\/\/[^/]*:9200/],
-    configKeys: ["spring.elasticsearch.uris", "spring.data.elasticsearch.client.reactive.endpoints", "spring.data.elasticsearch.uris"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseEsUrl(url);
@@ -148,30 +144,48 @@ class ElasticsearchDialect extends SearchDialect {
     const es = client as ClientV8;
     const index = config.database;
     if (!index) throw new Error("ES 连接缺少默认 index（database 字段）");
-    // 注：DSL 需整体透传为 body——kind 只做分类，原文从 sql 取（JSON.parse 失败即 query_string，已在上游分支处理）
-    const body = kind.type === "read" && kind.endpoint === "_search"
-      ? (JSON.parse(sql) as Record<string, unknown>)
-      : undefined;
+    // 注：信封顶层的 index 是通用字段（可临时覆盖默认 index），不属端点体，送给端点前摘掉。
+    // **size 不能摘**：它是 _search body 的合法字段，`{size:0, aggs:{...}}` 的纯聚合查询靠它
+    // 抑制命中；摘掉后会被注入 maxRows，聚合退化成普通搜索（v1.3.7 自查发现的回归）。
+    const parsed = kind.type === "query_string" ? undefined : (JSON.parse(sql) as Record<string, unknown>);
+    const envelope = parsed ? { ...parsed } : undefined;
+    if (envelope) delete envelope.index;
+    const target = typeof parsed?.index === "string" && parsed.index.trim() ? parsed.index.trim() : index;
     if (kind.type === "query_string") {
-      const res = await es.search({ index, size: opts.maxRows, q: kind.text });
+      const res = await es.search({ index: target, size: opts.maxRows, q: kind.text });
       return hitsToRows(unwrap(res));
     }
     if (kind.type === "read") {
       if (kind.endpoint === "_count") {
-        const res = await es.count({ index });
+        // count 信封的形态是 {count: {query: ...}}——query 挂在 count 值里，不在信封顶层
+        // （v1.3.7 曾写成 envelope?.query，恒 undefined，条件仍被静默忽略）
+        const inner = envelope?.count;
+        const query = inner !== null && typeof inner === "object"
+          ? (inner as { query?: unknown }).query
+          : undefined;
+        const res = query !== undefined && query !== null
+          ? await es.count({ index: target, query } as Parameters<ClientV8["count"]>[0])
+          : await es.count({ index: target });
         const count = (unwrap(res) as unknown as { count?: number }).count ?? 0;
         // rowCount 为“取回行数”（1 行 = 计数值本身），实际计数在单元格里，避免“返回 88 行”却只给一行的误读
         return { columns: ["count"], rows: [[count]], rowCount: 1 };
       }
       if (kind.endpoint === "_mget") {
-        // 注：_mget 需兼容 v7 客户端的 body 形态（本文件为 v7/v8/v9 三客户端分发），
-        // 而 v8/v9 的类型已把请求体改为顶层 docs，故按运行时通用形态传参并放宽参数类型。
-        const res = await es.mget({ index, body: { docs: [] } } as unknown as Parameters<ClientV8["mget"]>[0]);
+        // 信封形态：{mget: {...}} / {mget_docs: [...]} / {mget: {docs: [...]}}
+        const docs = Array.isArray(envelope?.mget)
+          ? envelope.mget
+          : Array.isArray(envelope?.mget_docs)
+            ? envelope.mget_docs
+            : (envelope?.mget as { docs?: unknown[] } | undefined)?.docs ?? [];
+        if (docs.length === 0) throw new Error('_mget 需要在信封里提供 docs，如 {"mget":{"docs":[{"_id":"1"}]}} 或 {"mget_docs":[{"_id":"1"}]}');
+        // v7 客户端用 body，v8+ 用顶层 docs——两边都传，由客户端自行忽略多余字段
+        const res = await es.mget({ index: target, body: { docs }, docs } as unknown as Parameters<ClientV8["mget"]>[0]);
         return docsToRows(unwrap(res));
       }
-      // _search：DSL 整体即 body；body 显式带数字 size 时不再注入顶层 size
+      // _search：去掉信封字段后的剩余部分即 body；显式带数字 size 时不再注入顶层 size
       // （尊重调用方分页与 size:0 纯聚合意图，否则顶层 size 会覆盖 body.size 使聚合退化为普通搜索）
-      const searchParams: Record<string, unknown> = { index, body };
+      const body = envelope && Object.keys(envelope).length > 0 ? envelope : undefined;
+      const searchParams: Record<string, unknown> = { index: target, body };
       if (typeof (body as { size?: unknown } | undefined)?.size !== "number") searchParams.size = opts.maxRows;
       const res = await es.search(searchParams as Parameters<ClientV8["search"]>[0]);
       return hitsToRows(unwrap(res));

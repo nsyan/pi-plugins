@@ -4,8 +4,8 @@
 // （写关键字集、会话变量前缀、版本查询、DESCRIBE 解析）。
 import type { ConnConfig, DbConnection, ExecOpts, QueryResult,
   ListTablesResult, DescribeTableResult, TestConnectionResult, TableInfo } from "../core/types.js";
-import { splitStatements, isWriteStatement, isDropStatement } from "../core/sql-text.js";
-import type { Dialect, Verdict, Fingerprints } from "./dialect.js";
+import { splitStatements, isWriteStatement, isDropStatement, isHighRiskStatement, writeReasonOf } from "../core/sql-text.js";
+import type { Dialect, Verdict } from "./dialect.js";
 import { likeMatch } from "./dialect.js";
 
 // ── HS2 会话/操作最小结构（按 hive-driver 实际 API: HiveSession/HiveOperation）───
@@ -49,14 +49,11 @@ export abstract class BigDataDialect implements Dialect {
   abstract label: string;
   abstract family: Dialect["family"];
   abstract defaultPort: number;
-  abstract fingerprints: Fingerprints;
   abstract parseUrl(url: string): ReturnType<Dialect["parseUrl"]>;
   abstract displayUrl(config: ConnConfig): string;
   abstract versionQuery(conn: DbConnection): Promise<string>;
   /** 方言的写关键字集（大小写不敏感正则片段，逐语句匹配） */
   protected abstract writeKeywords: RegExp;
-  /** 会话变量前缀：hive. / spark.（SET <prefix>key=value 在 withConnection 内下发） */
-  protected abstract sessionPrefix: string;
 
   // ── HS2 会话建立：openSession 由方言 doConnect 完成，client 即 Hs2Session ──
   protected abstract doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection>;
@@ -86,12 +83,14 @@ export abstract class BigDataDialect implements Dialect {
     if (readonly) {
       for (const s of stmts) {
         if (flagged(s)) {
-          return { ok: false, reason: `只读模式下不允许执行非查询语句：${s.slice(0, 80)}`, isWrite: true, summary };
+          const why = writeReasonOf(s) ?? "非查询语句";
+          return { ok: false, reason: `只读模式下不允许执行非查询语句（${why}）：${s.slice(0, 80)}`, isWrite: true, summary };
         }
       }
     }
     const isWrite = stmts.some(flagged);
-    return { ok: true, isWrite, summary };
+    const highRisk = isWrite && stmts.some((s) => flagged(s) && isHighRiskStatement(s));
+    return { ok: true, isWrite, highRisk, summary };
   }
 
   // ── 执行：executeStatement → 循环 fetch batch → 达 maxRows 即停 + truncated 标注 ──

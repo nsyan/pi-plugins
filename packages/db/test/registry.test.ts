@@ -5,7 +5,6 @@ import { registry, register, type Dialect } from "../src/dialects/index.js";
 
 const fake: Dialect = {
   id: "postgresql", label: "PostgreSQL", family: "relational", defaultPort: 5432,
-  fingerprints: { urlPatterns: [/^jdbc:postgresql:\/\//], configKeys: ["spring.datasource.url"] },
   parseUrl: () => null,
   withConnection: async (_c, _fn) => { throw new Error("nope"); },
   testConnection: async () => ({ success: false, error: "nope" }),

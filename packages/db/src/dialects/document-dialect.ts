@@ -4,7 +4,7 @@
 
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   QueryResult } from "../core/types.js";
-import type { Dialect, Verdict, Fingerprints } from "./dialect.js";
+import type { Dialect, Verdict } from "./dialect.js";
 
 // ── 信封分类（读写管控核心，Spec 共识 Q3）──────────────
 // 读白名单 + 写需确认 + 管理/DDL/服务端 JS 恒拒 + 未知命令保守按写（ES parseDsl 同款兜底）
@@ -32,6 +32,11 @@ const DENY_COMMANDS: ReadonlySet<string> = new Set([
   "reindex", "setparameter", "setfeaturecompatibilityversion", "logrotate",
   "enablesharding", "shardcollection", "movechunk", "moveprimary", "split",
   "applyops", "currentop", "clone", "copydb", "clonecollection", "$eval",
+]);
+
+/** 普通写命令（可回滚的 DML）：confirm_before_exec=never 时直执行，其余写命令不豁免 */
+const ORDINARY_WRITE_COMMANDS: ReadonlySet<string> = new Set([
+  "insert", "update", "delete", "findandmodify", "bulkwrite",
 ]);
 
 /** 服务端 JS 执行（任意深度出现即恒拒，Q3 共识） */
@@ -104,14 +109,17 @@ export function classifyEnvelope(sql: string): EnvelopeClassified {
   }
   // 3) aggregate 含 $out/$merge → 整条按写（readonly 由 isAllowed 统一裁决）
   if (cmdLower === "aggregate" && hasAnyKey(envelope, AGG_WRITE_KEYS)) {
-    return { envelope, verdict: { ok: true, isWrite: true, summary: `${summary}（$out/$merge 写回）` } };
+    return { envelope, verdict: { ok: true, isWrite: true, highRisk: true, summary: `${summary}（$out/$merge 写回）` } };
   }
   // 4) 读白名单
   if (READ_COMMANDS.has(cmdLower)) {
     return { envelope, verdict: { ok: true, isWrite: false, summary } };
   }
   // 5) 已知写命令与其余未知命令一律按写（未知写意图不可排除）
-  return { envelope, verdict: { ok: true, isWrite: true, summary } };
+  //    highRisk：只有普通 DML（insert/update/delete/...）在 never 策略下豁免确认，
+  //    索引/用户/权限/重命名以及未知命令都不豁免——影响面无法预估
+  const highRisk = !ORDINARY_WRITE_COMMANDS.has(cmdLower);
+  return { envelope, verdict: { ok: true, isWrite: true, highRisk, summary } };
 }
 
 // ── limit 注入（Spec 共识 Q8：无界查询自动封顶，bulk 上限 1000）───
@@ -210,7 +218,6 @@ export abstract class DocumentDialect implements Dialect {
   abstract label: string;
   abstract family: Dialect["family"];
   abstract defaultPort: number;
-  abstract fingerprints: Fingerprints;
   abstract parseUrl(url: string): ParsedTarget | null;
   abstract displayUrl(config: ConnConfig): string;
   abstract versionQuery(conn: DbConnection): Promise<string>;

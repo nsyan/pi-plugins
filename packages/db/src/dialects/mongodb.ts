@@ -8,7 +8,7 @@ import { MongoClient } from "mongodb";
 import type { ConnConfig, DbConnection, ParsedTarget,
   ListTablesResult, DescribeTableResult, TableInfo, ColumnInfo } from "../core/types.js";
 import { DocumentDialect } from "./document-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析：mongodb(srv)://[user:pass@]host[:port][,host2...][/db][?opts] ───
 // 兼收 Atlas SRV；IPv6 主机不在 v1 支持范围（split(":") 会误切，见 parseHosts 注释）
@@ -179,10 +179,6 @@ class MongoDialect extends DocumentDialect {
   label = "MongoDB";
   family = "document" as const;
   defaultPort = 27017;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^mongodb(\+srv)?:\/\//],
-    configKeys: ["spring.data.mongodb.uri", "spring.mongodb.uri"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseMongoUrl(url);

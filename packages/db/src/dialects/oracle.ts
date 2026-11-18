@@ -3,7 +3,7 @@ import oracledb from "oracledb";
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   ListTablesResult, DescribeTableResult, TableInfo, ColumnInfo, TestConnectionResult } from "../core/types.js";
 import { RelationalDialect } from "./relational-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析（从 index.ts parseJdbcUrl 原样搬入：service 名 + SID 双分支）───
 
@@ -38,10 +38,6 @@ class OracleDialect extends RelationalDialect {
   label = "Oracle";
   family = "relational" as const;
   defaultPort = 1521;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^jdbc:oracle:thin:@/],
-    configKeys: ["spring.datasource.url"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseOracleUrl(url);
@@ -62,6 +58,8 @@ class OracleDialect extends RelationalDialect {
   }
 
   protected async doConnect(config: ConnConfig, _timeoutMs: number): Promise<DbConnection> {
+    // oracledb 的 Thin 模式没有 connection timeout 选项（只有 statement timeout），
+    // 建连超时依赖调用方 withConnection 的上限；此处保留参数占位并显式声明。
     const conn = await oracledb.getConnection({
       user: config.username,
       password: config.password,

@@ -3,7 +3,7 @@ import dmdb from "dmdb";
 import type { ConnConfig, DbConnection, ExecOpts, ParsedTarget,
   ListTablesResult, DescribeTableResult, ColumnInfo } from "../core/types.js";
 import { RelationalDialect } from "./relational-dialect.js";
-import { register, filterTables, type Fingerprints } from "./dialect.js";
+import { register, filterTables } from "./dialect.js";
 
 // ── URL 解析（JDBC 主形态 + 原生 URI 双形态，Spec §7）───
 
@@ -37,10 +37,6 @@ class DmDialect extends RelationalDialect {
   label = "DM";
   family = "relational" as const;
   defaultPort = DM_DEFAULT_PORT;
-  fingerprints: Fingerprints = {
-    urlPatterns: [/^jdbc:dm:\/\//, /^dm:\/\//],
-    configKeys: ["spring.datasource.url"],
-  };
 
   parseUrl(url: string): ParsedTarget | null {
     return parseDmUrl(url);
@@ -50,7 +46,7 @@ class DmDialect extends RelationalDialect {
     return `jdbc:dm://${config.host}:${config.port}${config.database ? "/" + config.database : ""}`;
   }
 
-  protected async doConnect(config: ConnConfig, _timeoutMs: number): Promise<DbConnection> {
+  protected async doConnect(config: ConnConfig, timeoutMs: number): Promise<DbConnection> {
     let conn: dmdb.Connection;
     try {
       // loginEncrypt=false：跳过握手消息加密。dmdb 默认走 MD5/RSA 遗留算法，
@@ -62,7 +58,8 @@ class DmDialect extends RelationalDialect {
         connectString: `${config.host}:${config.port}`,
         schema: config.database,
         loginEncrypt: false,
-      });
+        connectTimeout: timeoutMs,
+      } as dmdb.ConnectionAttributes);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (/digital envelope routines|ERR_OSSL/i.test(msg)) {

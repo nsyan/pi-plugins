@@ -40,9 +40,18 @@ describe("write/drop detection", () => {
     assert.equal(isWriteStatement("SELECT * FROM t"), false);
     assert.equal(isDropStatement("SELECT * FROM t"), false);
   });
-  it("conservative: DML keyword inside CTE string literal counts as write", () => {
-    // 有意保守：不剥离字符串字面量，偏安全方向（Spec §4.1）
-    assert.equal(isWriteStatement("WITH t AS (SELECT 'DELETE FROM x') SELECT * FROM t"), true);
+  it("CTE 里的真 DML 仍判写（字面量剥离不削弱检测）", () => {
+    assert.equal(isWriteStatement("WITH t AS (SELECT 1) DELETE FROM users"), true);
+  });
+  it("字面量里的 DML 关键词不再误判（v1.3.7 修正：剥离字面量后再判副作用）", () => {
+    // 旧断言（"有意保守：不剥离字符串字面量"）把 `SELECT 'FOR UPDATE'`、
+    // `WHERE note = 'x INTO y'` 这类纯读语句也判成写——白名单姿态下误报面进一步扩大。
+    // 现在只剥字面量做判定（执行仍用原语句），误报消失、真写不漏。
+    assert.equal(isWriteStatement("WITH t AS (SELECT 'DELETE FROM x') SELECT * FROM t"), false);
+    assert.equal(isWriteStatement("SELECT 'FOR UPDATE' AS note"), false);
+    assert.equal(isWriteStatement("SELECT a FROM t WHERE note = 'FOR UPDATE'"), false);
+    assert.equal(isWriteStatement("SELECT REPLACE(name, 'a INTO b', '') FROM t"), false);
+    assert.equal(isWriteStatement("SELECT 'nextval(' AS s"), false);
   });
   it("MySQL backslash escape does not hide DROP", () => {
     const stmts = splitStatements("SELECT 'a\\'; DROP TABLE t");

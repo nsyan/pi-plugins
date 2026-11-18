@@ -1,5 +1,8 @@
 // core/audit.ts —— 写操作审计日志（v1.1 UX 共识 Q4 + 轮转共识：按本地日期一天一个 .jsonl，SQL 存完整原文不截断）
-// 注：本模块只做文件 IO，不依赖任何 pi 运行时模块；审计失败静默降级，绝不阻断查询主流程
+// 注：本模块只做文件 IO，不依赖任何 pi 运行时模块。
+// v1.3.7：appendAuditLog 返回是否真的落盘；生产/强制只读连接的写操作必须**先落盘再执行**
+//        （与 ssh 包 `appendAudit(..., { required: true })` 同姿态）——审计不可写就不执行，
+//        否则「写操作可追溯」只是配置项，不是保证。
 
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -47,11 +50,10 @@ const chmoddedFiles = new Set<string>();
 
 /**
  * 追加一条审计记录到按天轮转的 JSONL 文件（一行一条）。
- * 同步写入保证返回结果前已落盘（单次开销亚毫秒级）；失败静默降级不阻断主流程。
- * @param entry 审计条目
- * @param dir 审计目录，默认 AUDIT_DIR（测试可注入临时目录）
+ * 同步写入保证返回结果前已落盘（单次开销亚毫秒级）。
+ * @returns true = 已落盘；false = 写失败（调用方根据 `required` 决定是否阻断）
  */
-export function appendAuditLog(entry: AuditEntry, dir: string = AUDIT_DIR): void {
+export function appendAuditLog(entry: AuditEntry, dir: string = AUDIT_DIR): boolean {
   try {
     if (!ensuredDirs.has(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -63,5 +65,8 @@ export function appendAuditLog(entry: AuditEntry, dir: string = AUDIT_DIR): void
       try { chmodSync(file, 0o600); } catch { /* 平台不支持等场景容错 */ }
       chmoddedFiles.add(file);
     }
-  } catch { /* 审计失败不影响主流程 */ }
+    return true;
+  } catch {
+    return false; // 普通连接的审计失败不影响主流程；required 场景由调用方拒绝执行
+  }
 }
