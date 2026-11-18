@@ -43,6 +43,20 @@ export function backupLocation(remotePath: string, root?: string, stamp = Date.n
   return `${remotePath}.bak.${stamp}`;
 }
 
+/**
+ * 部署失败时清理本次的半成品：只删这个 release 目录与它的 `.part`。
+ * 必须只针对本次 releaseId——`releases/` 里还有上一版，多删一个就等于毁掉回滚点。
+ * 失败后留下的空 release 目录会被 `ssh_rollback` 当成有效候选，也会被 `keepReleases` 算进配额，
+ * 所以上传成功到切软链之间任何一步失败都要调这里。
+ */
+export function discardPartialCommand(plan: ReleasePlan): string {
+  return `rm -rf ${quote(plan.releaseDir)} ${quote(plan.partPath)}`;
+}
+
+function quote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
 /** 同一路径只留最近 keep 份。返回要删的文件名，不含目录。 */
 export function staleBackups(names: string[], fileName: string, keep = 3): string[] {
   const mine = names.filter((name) => {

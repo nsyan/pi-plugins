@@ -35,6 +35,13 @@
 - **测试**：新增 `sql-write-detection.test.ts`（白名单姿态 / 高风险标记 / dollar-quoted 块 / 四家族只读拦截，20 例）、`policy-hardening.test.ts`（highRisk 通道 / auditRequired / 审计 fail-closed，12 例）、`config-atomic.test.ts`（原子写 / 损坏检测 / 导出权限，5 例），测试 189 → 226
 - **e2e 脚本**：新增 `scripts/e2e-live.mts`（用本机真实连接跑测试连接/列表/结构/查询/只读拦截）、`scripts/e2e-tools.mts`（mock 宿主装载扩展，验证工具层拦截、理由校验、审计顺序）、`scripts/e2e-write.mts`（临时 schema 内跑完整 DDL+DML 并清理，确认收紧后合法写仍能执行）
 
+## [ssh 0.1.5] - 2026-11-18
+
+### Fixed（packages/ssh）
+
+- **部署失败后残留半成品 release 目录**：`ssh_deploy` 上传成功后、切软链之前的任何一步失败（压缩包成员越界、解包失败、`tar -tzf` 读不出成员），此前直接抛错走人，远端留下 `releases/<ts>` 与 `releases/<ts>.part`。**守卫本身是对的**（越界包在解包前就被拒绝，实测无文件逃逸），但残留的空 release 目录会被 `ssh_rollback` 当成有效候选、也会被 `keepReleases` 算进配额——下次回滚可能切到一个空目录。现新增 `discardPartialCommand(plan)` 并在该区间包 `try/catch`，失败即清掉**本次** `releaseDir` 与 `.part`；只针对本次 `releaseId`，不用通配、不碰 `releases/` 里的其他版本
+- 回归测试：新增 3 条（只删本次两个路径且不含通配、自定义 `releasesDir` 跟着走、路径含单引号时正确转义），测试 209 → 212；真机复测：越界包被拒后 `releases/` 残留 0、无逃逸文件
+
 ## [ssh 0.1.4] - 2026-11-18
 
 ### Fixed（packages/ssh）—— `/ssh` 面板代码审查发现的 8 个缺陷

@@ -1,6 +1,6 @@
 {
   "name": "@nsyan/ssh",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "AI 远程运维扩展 for pi coding agent：SSH/SFTP/FTP 主机管理、危险命令确认、审计与可回滚部署 | Remote ops for the pi agent: SSH, SFTP and FTP with confirmation, audit and rollback",
   "keywords": [
     "pi-extension",

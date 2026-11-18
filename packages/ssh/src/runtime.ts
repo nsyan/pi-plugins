@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendAudit, defaultAuditPath } from "./core/audit.js";
-import { backupLocation, checkReleaseId, healthLoopCommand, planRelease, rejectArchiveMembers, releaseIdNow, staleBackups } from "./core/deploy.js";
+import { backupLocation, checkReleaseId, discardPartialCommand, healthLoopCommand, planRelease, rejectArchiveMembers, releaseIdNow, staleBackups } from "./core/deploy.js";
 import { waitCommand, type WaitFor } from "./core/wait.js";
 import { loadHosts } from "./core/config.js";
 import { shellQuote, withinRoot } from "./core/guard.js";
@@ -679,14 +679,33 @@ function concrete(profile: HostProfile): HostProfile {
       step("创建目录");
       await remote.runner.checked(`mkdir -p ${shellQuote(plan.sharedDir)} ${shellQuote(plan.releaseDir)}`);
       step(`上传 ${bytes} 字节`);
-      if (kind === "tar") {
-        await remote.put(input.localPath, plan.partPath);
-        const listed = await remote.runner.checked(`tar -tzf ${shellQuote(plan.partPath)}`);
-        const rejected = rejectArchiveMembers(listed.stdout.split(/\n/), plan.releaseDir);
-        if (rejected.length > 0) throw new BoundsError(`压缩包成员越界：${rejected.join(", ")}`);
-        await remote.runner.checked(`tar -xzf ${shellQuote(plan.partPath)} -C ${shellQuote(plan.releaseDir)} && rm -f ${shellQuote(plan.partPath)}`);
-      } else {
-        await remote.put(input.localPath, `${plan.releaseDir}/${fileName}`);
+      /**
+       * 上传后到切软链之间任何一步失败（成员越界、解包失败、tar 读不出成员），
+       * 都必须把刚建的 release 目录与 .part 清掉：否则远端留下一个半成品目录，
+       * 下次 `ssh_rollback` 会把它当成候选（虽然 .part 已过滤，但空的 release 目录
+       * 会被当成有效版本），`keepReleases` 也会把它算进配额。
+       * 清理只针对本次 releaseId 的两个路径，不碰 releases/ 里的其他版本。
+       */
+      const discardPartial = async (error: unknown) => {
+        try {
+          await remote.runner.tryRun(discardPartialCommand(plan));
+        } catch {
+          // 清理失败不掩盖原始错误
+        }
+        throw error;
+      };
+      try {
+        if (kind === "tar") {
+          await remote.put(input.localPath, plan.partPath);
+          const listed = await remote.runner.checked(`tar -tzf ${shellQuote(plan.partPath)}`);
+          const rejected = rejectArchiveMembers(listed.stdout.split(/\n/), plan.releaseDir);
+          if (rejected.length > 0) throw new BoundsError(`压缩包成员越界：${rejected.join(", ")}`);
+          await remote.runner.checked(`tar -xzf ${shellQuote(plan.partPath)} -C ${shellQuote(plan.releaseDir)} && rm -f ${shellQuote(plan.partPath)}`);
+        } else {
+          await remote.put(input.localPath, `${plan.releaseDir}/${fileName}`);
+        }
+      } catch (error) {
+        await discardPartial(error);
       }
       step("切换 current");
       await remote.runner.checked(`ln -sfn ${shellQuote(plan.releaseDir)} ${shellQuote(plan.currentLink)}`);

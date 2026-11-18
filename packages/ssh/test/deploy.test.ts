@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { backupLocation, healthLoopCommand, planRelease, rejectArchiveMembers, staleBackups } from "../src/core/deploy.js";
+import { backupLocation, discardPartialCommand, healthLoopCommand, planRelease, rejectArchiveMembers, staleBackups } from "../src/core/deploy.js";
 import { withinRoot } from "../src/core/guard.js";
 
 describe("withinRoot", () => {
@@ -86,5 +86,28 @@ describe("staleBackups 与备份目录", () => {
   it("部署根内收进 .pi-ssh-backup，根外留在同目录", () => {
     assert.equal(backupLocation("/srv/app/web/index.html", "/srv/app", 123), "/srv/app/.pi-ssh-backup/web/index.html.123");
     assert.equal(backupLocation("/tmp/x.txt", "/srv/app", 123), "/tmp/x.txt.bak.123");
+  });
+});
+
+describe("discardPartialCommand", () => {
+  const plan = planRelease({ root: "/srv/app" }, "20261118-082236", "rel.tar.gz");
+
+  it("只删本次 release 目录与它的 .part，不碰 releases/ 里其他版本", () => {
+    const cmd = discardPartialCommand(plan);
+    assert.equal(cmd, "rm -rf '/srv/app/releases/20261118-082236' '/srv/app/releases/20261118-082236.part'");
+    // 不能出现通配或上层目录：多删一个就等于毁掉回滚点
+    assert.equal(cmd.includes("*"), false);
+    assert.equal(cmd.includes("releases'"), false);
+  });
+
+  it("自定义 releasesDir 时跟着走", () => {
+    const custom = planRelease({ root: "/srv/app", releasesDir: "versions" }, "v1", "a.tar.gz");
+    assert.equal(discardPartialCommand(custom), "rm -rf '/srv/app/versions/v1' '/srv/app/versions/v1.part'");
+  });
+
+  it("路径含单引号时被正确转义，不会拼出额外命令", () => {
+    const tricky = planRelease({ root: "/srv/it's" }, "v1", "a.tar.gz");
+    const cmd = discardPartialCommand(tricky);
+    assert.equal(cmd.includes(`'/srv/it'"'"'s/releases/v1'`), true);
   });
 });
