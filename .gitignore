@@ -20,6 +20,7 @@ logs/
 # IDE / 编辑器
 .vscode/
 .idea/
+.openidea/
 *.iml
 .vscode/*
 !.vscode/extensions.json
