@@ -1,18 +1,22 @@
 // core/hash.ts —— 本地与远端都用同一种 sha256。远端按命令依次降级。
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { shellQuote } from "./guard.js";
 
+/**
+ * 本地文件的 sha256。
+ * 目录必须先挡掉：`readableWebStream()` 对目录抛的 EISDIR 会逃成 unhandledRejection，
+ * 在长驻宿主里直接把进程打掉，`try/catch` 拦不住。用 createReadStream 的异步迭代器，
+ * 错误才会老老实实落到 await 上。
+ */
 export async function sha256File(path: string): Promise<{ hash: string; bytes: number }> {
   const info = await stat(path);
-  const handle = await open(path, constants.O_RDONLY);
-  const hash = createHash("sha256");
-  try {
-    for await (const chunk of handle.readableWebStream() as AsyncIterable<Uint8Array>) hash.update(chunk);
-  } finally {
-    await handle.close();
+  if (info.isDirectory()) {
+    throw new Error(`${path} 是目录。上传不接受目录：先在本地打成一个压缩包，再传包。`);
   }
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
   return { hash: hash.digest("hex"), bytes: info.size };
 }
 

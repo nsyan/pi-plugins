@@ -178,18 +178,28 @@ interface ExecOpts {
 ```
 
 ### 4.1 ssh2 传输
-- 认证顺序 `[publickey, password]` 自控，`authHandler` 逐个 offer，最后被接受的即真实认证方式（回报给 `ssh_hosts test`）。
+- 认证方式报给 `ssh_hosts test` 的是 **profile 里配置的 kind**。ssh2 不直接暴露协商结果，
+  要拿「服务器真正接受了哪一种」得自己写 `authHandler` 逐个 offer 并记录；本期不做，不假称已知。
+  `agent` 靠 `SSH_AUTH_SOCK`，没有就直接失败；`passphraseRef` 与 `secretRef` 同样走钥匙串/0600 文件。
 - 主机密钥校验 fail-closed 四态：`match | unknown | changed | revoked`。
   `unknown` 不自动接受——抛 `HostKeyUnknownError` 携带指纹。
-  **`acceptNewHostKey` 只存在于 `ssh_hosts test`、`/ssh add`、`ssh_host_save`**，`ssh_exec` 等执行工具没有这个参数；
-  执行中遇到未知指纹就停，指引去 `ssh_hosts test` 核对。`changed`/`revoked` 直接硬失败，提示 `ssh-keygen -R`。
+  指纹格式是密钥原文的 sha256、base64、去掉末尾 `=`，即 `SHA256:...`，能直接和 `ssh-keygen -lf` 对照。
+  **`acceptNewHostKey` 只存在于 `ssh_hosts test`、`/ssh test`、`/ssh add`、`ssh_host_save`**，`ssh_exec` 等执行工具没有这个参数；
+  执行中遇到未知指纹就停，指引去 `ssh_hosts test` 核对。
+  而且它不是个可以直接打开的开关：建连路径一律先不带 `acceptNewHostKey` 试一次，
+  拿到 `HostKeyUnknownError` 后把指纹摆给用户确认，确认了才重试并写入 `known_hosts`。拒绝指纹 = 不保存。
+  `changed`/`revoked` 直接硬失败，提示 `ssh-keygen -R`。
 - 读写 OpenSSH 自己的 `~/.ssh/known_hosts`（端口非 22 用 `[host]:port`），与系统 ssh 互通。
 - SFTP：`fastPut`/`fastGet` 带 `step` 进度回调。本地 sha256 在传输流上计算，不传完再读盘。
-  上传先写 `<target>.part`，远端 `sha256sum` 一致才 `rename` 转正；不一致保留 .part，原文件不动。
-  覆盖前把原文件 `rename` 到备份目录（§6.4），这是元数据操作，不会把内容再复制一份。
+  上传先写 `<target>.part`，远端哈希一致才 `rename` 转正；不一致保留 .part，原文件不动。
+  覆盖前把原文件 `rename` 到备份目录（§6.4），这是元数据操作，不会把内容再复制一份；
+  跨文件系统时 `mv` 报 EXDEV，降级为 `cp -p` + `rm`，并在 `backupCopied` 里注明。
+  下载也做双端比对，不只看本地哈希。
 - keepalive：`keepaliveInterval` 30 秒。空闲后的半开 TCP（NAT 掐断）靠这个发现，而不是只看 socket 可读。
-- exec 走进程组看门狗（§6.2）。
+- exec 走进程组看门狗（§6.2）。所有远端命令都有超时，缺省 120 秒。
 - 一条 TCP 上多路 channel，同一主机同时最多 6 个（exec 与 SFTP 都算）。长命令占 1 个 channel，不堵住后续调用。
+  **同一 profile 的并发 connect 单飞**：第二个调用等第一个的结果，不会各建一条 TCP 把前一条泄漏在池外。
+  上传内部需要额外跑远端哈希时，用完就还名额，不占着两个。
 
 ### 4.2 openssh 传输
 - `spawn("ssh", ["-o", "BatchMode=yes", "-o", "ControlMaster=auto", "-o", "ControlPath=~/.pi/agent/ssh-cm/%C",
@@ -502,8 +512,8 @@ ssh_rollback {
 1. `ctx.ui.confirm` 展示「名称、user@host:port、传输、来源、可信度」；
 2. 缺字段（user、auth）在弹窗里补；密码走掩码输入；
 3. 同名三选一：覆盖 / 改名 / 跳过；
-4. 实测连接 + 指纹确认；
-5. 通过才写盘。任一环节取消 = skipped，不落半成品。
+4. 建连与指纹确认（TOFU，见 §4.1）；FTP/FTPS 没有主机密钥，这一步只验证能不能登录；
+5. 通过才写盘。任一环节取消 = skipped，**主机清单不落半成品**；密码已经写进 secrets 文件时一并删掉。
 
 **绝不静默建连**（与 db 插件同一硬原则）。
 
@@ -618,6 +628,64 @@ ssh_rollback {
 - §7.3：`waitFor` 的 `port` 走 `/dev/tcp` → `nc`，`http` 走 `curl` → `wget`，`file` 走 `test -e`。
 
 同日把单连接并发上限从 4 改为 6。上限仍然留着，避免一轮并行工具把 sshd 的会话数打满。
+
+2026-11-18 全量评审后的修复（代码与文档同步）：
+
+严重：
+
+- §6.2 看门狗：先 `exec 3<&0` + `exec 0</dev/null`，**再把命令放进后台**。之前的顺序让后台命令继承的还是通道，和 watcher 抢读。
+  `set -m` 不可用时退化为「超时只关通道」，并把警告写到 stderr。
+- §6.2 sudo：密码改走 **heredoc** 喂给 `sudo -S`，不再用 `printf '%s\n' "$PI_SSH_PW"`。
+  本机 `sh` 实跑验证：heredoc 不会二次展开，`p@ss w0rd$(id)` 原样送达，`ps` 里看不到密码。
+- §8：部署每一步都看退出码，失败即停，不会在解压失败后继续切软链。
+- §8 步骤 5：健康检查改成远端循环（`healthLoopCommand`，预算 60 秒），不是只跑一次。
+- §8 步骤 6：回退后复检；仍不健康就停下，并报出 `current` 指向和**两个 release 各自的失败输出**。
+- §8：清理旧版本用 `plan.releasesDir`，不再写死 `root/releases`；自定义 `releasesDir` 时不会删错目录。
+- §8：`df` 解析不出数字直接取消部署，不再默默跳过预检。
+- §6.3：生产主机的 destructive 改成**动作之前**写审计（`ssh_exec` / `ssh_sudo` / `ssh_deploy` / `ssh_rollback`）。
+  之前是执行完才写，审计不可写时命令已经跑完，模型很可能重试一次。
+- §7.1：`keyError` 和身份指纹从 runtime 级变量改成**每次连接一份**，并行调用不会再串到别的主机的指纹。
+- §7.1：同一 profile 的并发 `connect` 单飞，不再各建一条 TCP 把前一条泄漏在池外。
+- §7.1：重连只在 `connect` 阶段发生。命令已经交给通道之后不再重试，`rm` 和切软链不会被跑两次。
+- §8：`ssh_deploy` 透传 `signal`，卡住的 `tar` / `rm -rf` 可以中止；内部远端命令一律带超时。
+
+高：
+
+- §9：`selectHost` 支持 `allowActive`。`/ssh exec`、`/ssh test` 打活动主机；**工具调用仍然必须显式传 `host`**。
+- §10.2：建连改成「先实测、通过才写盘」。候选在内存里测，失败不落半成品，已写入 secrets 的密码一并删掉。
+- §4.1：`acceptNewHostKey` 不再是能直接打开的开关——先不带它试一次，拿到指纹给人确认，确认后才写 `known_hosts`。
+- §10.1：`/ssh add`、`/ssh edit` 会问「是否生产主机」，`prod` 标签有了入口，不再只能手改 JSON。
+- §4.1：三条上传路径对齐。openssh 补上双端 sha256、`.part` 转正、备份；FTP 备份改成带时间戳，非生产覆盖也要确认；
+  `ssh_get` 补上远端哈希比对，不再只算本地。
+- §6.4：备份位置按 `<root>/.pi-ssh-backup/<相对路径>.<ts>`，每路径留 3 份（`staleBackups`），删除范围限制在备份目录内；
+  `mv` 失败按 EXDEV 降级为 `cp -p` + `rm`，结果用 `backupCopied` 注明。openssh 路径同样做修剪。
+- §4.4：`auto` 在 `read` / `sudo` / `deploy` / `rollback` 上也生效，ProxyJump 主机不会再误走 ssh2 直连。
+- §4.1：`auth.kind === "agent"` 走 `SSH_AUTH_SOCK`（没有就明确失败），`passphraseRef` 已实现。
+
+中：
+
+- §4.2：`ControlPath` 已给出。并且**主动起 master**：实测发现 `sftp` / `scp` 自己不会留下常驻 master（只有 `ssh` 会），
+  不先 `ssh -f -N` 起一个，`ControlMaster=auto` 就是摆设。起 master 失败不致命，退回各自握手。
+  会话结束时 `ssh -O exit` 收掉，不留 5 分钟孤儿进程。实机验证：首次 952ms，复用后 117~134ms。
+- §4.2：openssh 的 `ssh_ls` / `ssh_read` 走 `sftp -b -`，不再直接拒绝。`ls -l` 的 longname 解析有单测，并拿真实 OpenSSH 输出核过。
+- §7.2：溢出文件由传输层落全文，不再先截到 200KB；补上 2000 行上限；`ssh_exec` 的 `onData` 按 100ms / 8KB 合并成 `onUpdate`，
+  窗口内的 chunk 是**攒起来**再发，不再丢弃。
+- §7.3：`waitFor` 的 `http` 用 `shellQuote` 包住整条 URL（之前单引号替换会把 URL 露到 `bash -c` 外面），`port` 补 `nc -z`，`http` 补 `wget`。
+- §5：`secrets.ts` 在 JSON 损坏时**抛错**，不再当成空库——否则下一次 `putSecret` 会把其他主机的密码一起覆盖掉。
+- §5：`platformKeychain()` 不再把所有非 Linux 都当 macOS；其他系统直接说明没有钥匙串。
+- `ssh_read` 按 512KB 和 UTF-8 字符边界截断（`clipUtf8`），不再可能切出半个多字节字符。
+- `list` / `read` / `get` 用完关闭 SFTP 通道；隧道 `listen` 失败时归还租约，不会永久占着名额导致连接无法空闲关闭。
+- `ssh_deploy` 的确认框列出**即将删除的具体 release**，每步实时 `onStep`。
+- `package.json` 的 `files` 补上 `skills/`，发包不再丢技能；`skills/deploy` 改成「只使用主机配置里的 deploy 布局」。
+- 密码掩码：有终端输入时用 `onTerminalInput` 显示 `*`；没有才退化为「先确认再明文输入」。
+- `ssh_read` / `ssh_ls` 对 FTP 明确说明不支持，指引改用 `ssh_get`。
+
+仍做不到、如实声明的：
+
+- `basic-ftp` 5 没有主动模式，`active: true` 直接报错（§4.3 已改口径）。
+- macOS `security` 不能从 stdin 收密码，`-w` 会把密码留在进程表，所以**新密码一律落 0600 文件**，钥匙串只用于读取已有项（§5 已改口径）。
+- `ssh_hosts test` 报的认证方式是 **profile 里配置的 kind**，不是协商结果。ssh2 不直接暴露协商结果，要拿真值得自己写 `authHandler`（§4.1 已改口径）。
+- FTP/FTPS 没有远端哈希，只有字节数；本机也没有 21 端口可实测。
 
 同日按评审收口：
 

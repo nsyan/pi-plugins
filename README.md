@@ -59,7 +59,7 @@ pnpm test             # 运行全部包的测试
 
 ## 📜 更新记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.5**（2026-10-21，修复 hive/spark 依赖链缺 `ws` 致扩展整体加载失败）、ssh **0.1.0**（首个公开版）。
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.5**（2026-10-21，修复 hive/spark 依赖链缺 `ws` 致扩展整体加载失败）、ssh **0.1.1**（openssh 传输补齐、首次连接指纹确认、doctor 按 PATH 探测）。
 
 ## 📄 许可
 

@@ -19,13 +19,18 @@ const { Client } = createRequire(import.meta.url)("basic-ftp") as {
 
 async function open(profile: HostProfile) {
   if (profile.active) throw new UnsupportedError("basic-ftp 5 只支持被动模式，主动模式无法开启。");
+  // 密码必须是已解析的明文。`secretRef` 里的 `file:...#name` / `keychain:...` 是引用，
+  // 原样当密码发出去只会得到 530。解析由 runtime.resolveProfile 统一完成。
+  const password = profile.auth.password
+    ?? (profile.auth.secretRef && !/^(file|keychain):/.test(profile.auth.secretRef) ? profile.auth.secretRef : undefined);
+  if (!password) throw new UnsupportedError("没有可用的 FTP 密码。先确认 ssh-secrets.json 里有这台主机的条目。");
   const client = new Client();
   const secure = profile.transport === "ftps" ? (profile.secure === "implicit" ? "implicit" : true) : false;
   await client.access({
     host: profile.host,
     port: profile.port ?? (profile.secure === "implicit" ? 990 : 21),
     user: profile.user,
-    password: profile.auth.secretRef,
+    password,
     secure,
     secureOptions: profile.insecure ? { rejectUnauthorized: false } : undefined,
   });
@@ -59,6 +64,18 @@ export async function ftpPut(profile: HostProfile, localPath: string, remotePath
     }
     await client.rename(part, remotePath);
     return { bytes, backupPath };
+  } finally {
+    client.close();
+  }
+}
+
+export async function ftpExists(profile: HostProfile, remotePath: string): Promise<boolean> {
+  const client = await open(profile);
+  try {
+    await client.size(remotePath);
+    return true;
+  } catch {
+    return false;
   } finally {
     client.close();
   }

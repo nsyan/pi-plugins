@@ -3,10 +3,12 @@ import { Type } from "typebox";
 import { readAudit, defaultAuditPath } from "./src/core/audit.js";
 import { loadHosts, saveHosts, defaultConfigPath } from "./src/core/config.js";
 import { doctorLines } from "./src/core/doctor.js";
+import { closeControlMasters } from "./src/transports/openssh.js";
 import { parseSshConfig } from "./src/scan/ssh-config.js";
 import { projectDeployFiles } from "./src/scan/project.js";
 import { saveHostCandidate } from "./src/scan/save.js";
-import { defaultSecretsPath, putSecret } from "./src/core/secrets.js";
+import { defaultSecretsPath, deleteSecret, putSecret } from "./src/core/secrets.js";
+import { HostKeyUnknownError, type HostProfile } from "./src/core/types.js";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -59,9 +61,48 @@ async function readSecret(
   });
 }
 
+/**
+ * 首次连接的指纹必须给人看过才算数。
+ * 未知密钥先失败，把指纹摆出来让人确认，确认后才写 known_hosts。
+ */
+async function confirmUnknownKey(
+  error: unknown,
+  ui: { confirm: (title: string, message: string) => Promise<boolean> },
+): Promise<boolean> {
+  if (!(error instanceof HostKeyUnknownError)) return false;
+  return ui.confirm("未知主机密钥", `${error.message}\n\n用 ssh-keygen -lf 核对后，确认记录这个指纹并继续？`);
+}
+
+async function testWithTofu(
+  hostName: string | undefined,
+  ui: { confirm: (title: string, message: string) => Promise<boolean> },
+) {
+  try {
+    // 命令侧允许缺省打活动主机；工具调用仍然必须显式传 host。
+    return await runtime.testHost({ host: hostName, allowActive: true });
+  } catch (error) {
+    if (!(await confirmUnknownKey(error, ui))) throw error;
+    return runtime.testHost({ host: hostName, allowActive: true, acceptNewHostKey: true });
+  }
+}
+
+/** 测一个还没入库的候选。通过才写盘，拒绝指纹 = 不保存。 */
+async function testProfileWithTofu(
+  profile: HostProfile,
+  ui: { confirm: (title: string, message: string) => Promise<boolean> },
+) {
+  try {
+    return await runtime.testProfile(profile);
+  } catch (error) {
+    if (!(await confirmUnknownKey(error, ui))) throw error;
+    return runtime.testProfile(profile, true);
+  }
+}
+
 export default function sshExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     void runtime.closeTunnels();
+    void closeControlMasters();
   });
 
   pi.registerTool({
@@ -300,9 +341,14 @@ export default function sshExtension(pi: ExtensionAPI) {
       dryRun: Type.Optional(Type.Boolean({ description: "只返回剧本，不上传不切换" })),
       reason: Type.Optional(Type.String({ description: "生产主机必填" })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       try {
-        const result = await runtime.deploy({ ...params, ui: ctx.ui });
+        const result = await runtime.deploy({
+          ...params,
+          signal,
+          onStep: (message) => onUpdate?.({ content: [{ type: "text", text: message }], details: { step: message } }),
+          ui: ctx.ui,
+        });
         if (result.dryRun) return text(`只生成剧本，未执行。目标 ${result.current}`, result);
         return text(result.rolledBack ? `健康检查失败，已切回 ${result.current}` : `已切换到 ${result.current}`, result);
       } catch (error) {
@@ -396,26 +442,27 @@ export default function sshExtension(pi: ExtensionAPI) {
       const current = loadHosts();
       const choice = params.choice ?? (current.hosts[params.name] ? undefined : "rename");
       if (!choice) return text("同名主机已存在。choice 需要是 overwrite、rename 或 skip。", { saved: false });
-      let secretRef: string | undefined;
+      const saved = saveHostCandidate(current, params, choice);
+      if (!saved.saved) return text("同名主机已跳过", { saved: false });
+      const candidate = saved.file.hosts[saved.name];
+      let wroteSecret = false;
+      let profile = candidate;
       if (!params.privateKeyPath) {
         const password = await readSecret(ctx, "登录密码", "密码不进入对话记录");
         if (!password) return text("没有密码，未保存", { saved: false });
-        secretRef = `pending:${password}`;
+        putSecret(defaultSecretsPath(), saved.name, password);
+        wroteSecret = true;
+        profile = { ...candidate, auth: { ...candidate.auth, secretRef: `file:${defaultSecretsPath()}#${saved.name}` } };
       }
-      const saved = saveHostCandidate(current, { ...params, secretRef }, choice);
-      if (!saved.saved) return text("同名主机已跳过", { saved: false });
-      if (secretRef?.startsWith("pending:")) {
-        putSecret(defaultSecretsPath(), saved.name, secretRef.slice("pending:".length));
-        saved.file.hosts[saved.name].auth.secretRef = `file:${defaultSecretsPath()}#${saved.name}`;
-      }
-      saveHosts(defaultConfigPath(), saved.file);
       try {
-        const tested = await runtime.testHost({ host: saved.name, acceptNewHostKey: params.acceptNewHostKey === true });
-        return text(`已保存 ${saved.name}，${tested.auth} ${tested.fingerprint} ${tested.latencyMs}ms`, { saved: true, ...tested });
+        const tested = params.acceptNewHostKey === true
+          ? await runtime.testProfile(profile, true)
+          : await testProfileWithTofu(profile, ctx.ui);
+        saved.file.hosts[saved.name] = profile;
+        saveHosts(defaultConfigPath(), saved.file);
+        return text(`已保存 ${saved.name}，${tested.auth} ${tested.fingerprint} ${tested.latencyMs}ms`, { saved: true, name: saved.name, ...tested });
       } catch (error) {
-        const next = loadHosts();
-        delete next.hosts[saved.name];
-        saveHosts(defaultConfigPath(), next);
+        if (wroteSecret) deleteSecret(defaultSecretsPath(), saved.name);
         return failure(error);
       }
     },
@@ -441,8 +488,8 @@ export default function sshExtension(pi: ExtensionAPI) {
       }
       if (sub === "test") {
         try {
-          const result = await runtime.testHost({ host: name });
-          ctx.ui.notify(`${name || "活动主机"} ${result.auth} ${result.fingerprint} ${result.latencyMs}ms`, result.ok ? "info" : "error");
+          const result = await testWithTofu(name, ctx.ui);
+          ctx.ui.notify(`${name || "活动主机"} ${result.auth} ${result.fingerprint || "无指纹"} ${result.latencyMs}ms`, result.ok ? "info" : "error");
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }
@@ -491,35 +538,41 @@ export default function sshExtension(pi: ExtensionAPI) {
         const keyPath = await ctx.ui.input("私钥路径，密码登录留空", current?.auth.privateKeyPath ?? "");
         const prod = await ctx.ui.confirm("生产主机", "这台机器的标签要包含 prod 吗？生产主机的写操作一律确认。");
         if (!hostName || !address || !user) return;
-        let secretRef = current?.auth.secretRef;
-        if (!keyPath) {
-          const password = await readSecret(ctx, "登录密码", "密码不进入对话记录");
-          if (!password && !secretRef) return;
-          if (password) {
-            putSecret(defaultSecretsPath(), hostName, password);
-            secretRef = `file:${defaultSecretsPath()}#${hostName}`;
-          }
-        }
         const saved = saveHostCandidate(loadHosts(), {
           name: hostName,
           host: address,
           user,
           privateKeyPath: keyPath || undefined,
-          secretRef,
           tags: prod ? ["prod"] : current?.tags?.filter((tag) => tag !== "prod"),
         }, sub === "edit" ? "overwrite" : "rename");
-        if (saved.saved) saveHosts(defaultConfigPath(), saved.file);
         if (!saved.saved) {
           ctx.ui.notify("未保存", "warning");
           return;
         }
+        const candidate = saved.file.hosts[saved.name];
+        let wroteSecret = false;
+        // 编辑时沿用原来的凭据；新密码按最终名字存，不用用户填的名字。
+        let secretRef = keyPath ? undefined : current?.auth.secretRef;
+        if (!keyPath) {
+          const password = await readSecret(ctx, "登录密码", "密码不进入对话记录");
+          if (!password && !secretRef) {
+            ctx.ui.notify("没有密码，未保存", "warning");
+            return;
+          }
+          if (password) {
+            putSecret(defaultSecretsPath(), saved.name, password);
+            wroteSecret = true;
+            secretRef = `file:${defaultSecretsPath()}#${saved.name}`;
+          }
+        }
+        const profile = { ...candidate, auth: { ...candidate.auth, secretRef } };
         try {
-          const tested = await runtime.testHost({ host: saved.name, acceptNewHostKey: true });
-          ctx.ui.notify(`已保存 ${saved.name}，${tested.fingerprint}`, "info");
+          const tested = await testProfileWithTofu(profile, ctx.ui);
+          saved.file.hosts[saved.name] = profile;
+          saveHosts(defaultConfigPath(), saved.file);
+          ctx.ui.notify(`已保存 ${saved.name}，${tested.auth} ${tested.fingerprint || "无指纹"} ${tested.latencyMs}ms`, "info");
         } catch (error) {
-          const next = loadHosts();
-          delete next.hosts[saved.name];
-          saveHosts(defaultConfigPath(), next);
+          if (wroteSecret) deleteSecret(defaultSecretsPath(), saved.name);
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }
         return;

@@ -2,6 +2,24 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [ssh 0.1.1] - 2026-11-18
+
+### Added（packages/ssh）
+
+- **openssh 传输补齐（列目录/读文件/上传/ControlMaster）**：此前 openssh 只跑命令，现在与 ssh2 对齐
+  - `listOpenSsh`/`readOpenSsh`：走 `sftp -b` 批处理，`parseSftpLongNames` 解析长格式（名称/大小/是否目录）
+  - `putOpenSsh`：`scp` 上传，sha256 校验、可带远端备份；跨文件系统 `mv` 报 EXDEV 时降级为复制
+  - `ensureControlMaster`/`closeControlMasters`：复用同一条连接，避免每次握手；会话关闭时统一释放
+  - 修复 stdin 必须保持 pipe：`exec 3<&0` 的看门狗靠这条通道判断客户端是否放弃，`stdio: "ignore"` 会让 fd 3 立刻 EOF、命令被自己的 watcher 秒杀（exit 143 + 空输出）
+- **首次连接 TOFU 指纹确认**：未知主机密钥先失败并摆出指纹，人确认后才写 known_hosts；`confirmUnknownKey`/`testWithTofu`/`testProfileWithTofu` 统一这一路径，拒绝指纹 = 不保存
+- **`ssh_doctor` 改为按 PATH 探测**：新增 `which()`，不再写死 `/usr/bin`（Homebrew/`/usr/local/bin`/NixOS 都不在那里，写死会把可用的 ssh 报成不可用）；openssh 三件套 `ssh`/`scp`/`sftp` 逐个报告缺失项
+
+### Changed（packages/ssh）
+
+- **健康检查改为远端循环**：新增 `healthLoopCommand`，把 `healthCmd` 包成 `while` 循环一次往返（默认 60s 预算），最后一轮输出留在 stdout 供失败报告；预算至少一轮
+- **传输池重构**：`runtime` 抽出 `RemoteRunner` 接口与 `poolRunner`/`opensshRunner` 两个实现，`remoteLines`/`checked` 统一入口；新增 `pruneBackups` 统一清理旧备份
+- **测试**：新增 `openssh.test.ts`（sftp 长格式解析），`rejectArchiveMembers` 补空行用例（`tar -tzf` 输出尾空串曾被当成成员，导致合法包全被判越界），测试 100 → 113
+
 ## [ssh 0.1.0] - 2026-11-18
 
 ### Added（packages/ssh）

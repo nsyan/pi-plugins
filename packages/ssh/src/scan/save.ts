@@ -35,9 +35,7 @@ export function saveHostCandidate(file: HostFile, candidate: HostCandidate, choi
     auth: {
       kind: candidate.privateKeyPath ? "key" : "password",
       privateKeyPath: candidate.privateKeyPath,
-      secretRef: candidate.privateKeyPath || candidate.secretRef?.startsWith("pending:")
-        ? undefined
-        : candidate.secretRef,
+      secretRef: candidate.privateKeyPath ? undefined : candidate.secretRef,
     },
     tags: candidate.tags,
     createdAt: file.hosts[name]?.createdAt ?? new Date().toISOString(),

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { backupLocation, planRelease, rejectArchiveMembers, staleBackups } from "../src/core/deploy.js";
+import { backupLocation, healthLoopCommand, planRelease, rejectArchiveMembers, staleBackups } from "../src/core/deploy.js";
 import { withinRoot } from "../src/core/guard.js";
 
 describe("withinRoot", () => {
@@ -39,6 +39,20 @@ describe("backupLocation", () => {
   });
 });
 
+describe("healthLoopCommand", () => {
+  it("在预算内循环，并把最后一轮输出留给失败报告", () => {
+    const script = healthLoopCommand("curl -fsS localhost", 5);
+    assert.equal(script.includes("while [ \"$i\" -lt 5 ]"), true);
+    assert.equal(script.includes("if { curl -fsS localhost; } >/dev/null 2>&1; then exit 0; fi"), true);
+    // 循环结束后再裸跑一次，让 stdout 带上失败原因
+    assert.equal(script.endsWith("curl -fsS localhost\nexit 1"), true);
+  });
+
+  it("预算至少一轮", () => {
+    assert.equal(healthLoopCommand("false", 0).includes('-lt 1 ]'), true);
+  });
+});
+
 describe("rejectArchiveMembers", () => {
   it("拒绝绝对路径、反斜杠和逃出目标目录的成员", () => {
     const rejected = rejectArchiveMembers(["dist/index.html", "/etc/passwd", "../secret", "ok/../../secret"], "/srv/app/releases/1");
@@ -46,6 +60,11 @@ describe("rejectArchiveMembers", () => {
   });
 
   it("目录自身和当前目录不算逃逸", () => {
-    assert.deepEqual(rejectArchiveMembers(["./dist/app.js", "dist/", ""], "/srv/app/releases/1"), [""]);
+    assert.deepEqual(rejectArchiveMembers(["./dist/app.js", "dist/", ""], "/srv/app/releases/1"), []);
+  });
+
+  it("尾部空行不算成员，否则任何合法包都被判越界", () => {
+    // tar -tzf 输出总以换行结尾，split 之后最后一项是空串
+    assert.deepEqual(rejectArchiveMembers("dist/app.js\ndist/assets/\n".split(/\n/), "/srv/app/releases/1"), []);
   });
 });

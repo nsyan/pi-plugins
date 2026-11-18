@@ -517,10 +517,14 @@ export class Ssh2Pool {
     if (!exists) return { copied: false };
     const source = quote(request.remotePath);
     const dest = quote(request.backupPath);
+    // 备份可能收进 <root>/.pi-ssh-backup/<相对路径>.<ts>，那个目录还不存在。
+    const prepared = await this.execLeased(profileId, `mkdir -p $(dirname ${dest})`);
+    if (prepared.exitCode !== 0) {
+      throw new TransferMismatchError(`建备份目录失败：${prepared.stderr || prepared.stdout}`);
+    }
     const moved = await this.execLeased(profileId, `mv ${source} ${dest}`);
     if (moved.exitCode === 0) return { path: request.backupPath, copied: false };
-    const copied = await this.execLeased(profileId, `cp -p ${source} ${dest} && rm -f ${source}`);
-    if (copied.exitCode !== 0) {
+    const copied = await this.execLeased(profileId, `cp -p ${source} ${dest} && rm -f ${source}`);    if (copied.exitCode !== 0) {
       throw new TransferMismatchError(`备份失败：${moved.stderr || copied.stderr || "mv 与 cp 都失败"}`);
     }
     return { path: request.backupPath, copied: true };

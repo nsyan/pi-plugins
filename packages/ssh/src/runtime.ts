@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendAudit, defaultAuditPath } from "./core/audit.js";
-import { backupLocation, checkReleaseId, planRelease, rejectArchiveMembers, releaseIdNow, staleBackups } from "./core/deploy.js";
+import { backupLocation, checkReleaseId, healthLoopCommand, planRelease, rejectArchiveMembers, releaseIdNow, staleBackups } from "./core/deploy.js";
 import { waitCommand, type WaitFor } from "./core/wait.js";
 import { loadHosts } from "./core/config.js";
 import { shellQuote } from "./core/guard.js";
@@ -11,6 +11,7 @@ import { getSecret, platformKeychain } from "./core/secrets.js";
 import { appendKnownHost, checkHostKey, hostKeyFingerprint } from "./core/known-hosts.js";
 import { classify, decide, isProdHost, type Policy } from "./core/policy.js";
 import {
+  AuthFailedError,
   BoundsError,
   ConfirmRejectedError,
   HostKeyChangedError,
@@ -22,8 +23,8 @@ import {
 } from "./core/types.js";
 import { Ssh2Pool, type ConnectHooks } from "./transports/ssh2.js";
 import { chooseTransport } from "./scan/auto.js";
-import { copyOpenSsh, execOpenSsh, putOpenSsh } from "./transports/openssh.js";
-import { ftpExecRejected, ftpGet, ftpList, ftpPut } from "./transports/ftp.js";
+import { copyOpenSsh, execOpenSsh, listOpenSsh, putOpenSsh, readOpenSsh } from "./transports/openssh.js";
+import { ftpExecRejected, ftpExists, ftpGet, ftpList, ftpPut } from "./transports/ftp.js";
 
 const OUTPUT_LIMIT = 50_000;
 
@@ -150,35 +151,124 @@ export function createRuntime(options: RuntimeOptions = {}) {
     return identity;
   }
 
+  async function testProfile(host: HostProfile, acceptNewHostKey: boolean) {
+    const started = Date.now();
+    const latencyMs = () => Date.now() - started;
+    // FTP/FTPS 没有主机密钥，只能验证能不能登录，不报指纹。
+    if (host.transport === "ftp" || host.transport === "ftps") {
+      await ftpList(await resolveProfile(host), ".");
+      return { ok: true, auth: host.auth.kind, fingerprint: "", keyType: "", latencyMs: latencyMs(), transport: host.transport };
+    }
+    // openssh 的主机密钥由系统 ssh 自己管，指纹不经我们手。
+    if (host.transport === "openssh") {
+      const result = await execOpenSsh(await resolveProfile(host), { command: "echo ok" });
+      if (result.exitCode !== 0) throw new AuthFailedError(result.stderr || `ssh 退出码 ${result.exitCode}`);
+      return { ok: true, auth: host.auth.kind, fingerprint: "", keyType: "", latencyMs: latencyMs(), transport: host.transport };
+    }
+    const identity = await connect(host, acceptNewHostKey);
+    const result = await pool.exec(host.id, { command: "echo ok" });
+    if (result.exitCode !== 0) throw new AuthFailedError(result.stderr || `echo ok 退出码 ${result.exitCode}`);
+    return {
+      ok: true,
+      auth: identity.auth,
+      fingerprint: identity.fingerprint,
+      keyType: identity.keyType,
+      latencyMs: latencyMs(),
+      transport: host.transport,
+    };
+  }
+
   function requireReason(host: HostProfile, danger: string, reason?: string): void {
     if (isProdHost(host) && danger === "destructive" && !reason?.trim()) {
       throw new PolicyDeniedError("生产主机的破坏性操作必须填写 reason，说明动机和影响范围。");
     }
   }
 
-  async function remoteLines(profileId: string, command: string): Promise<string[]> {
-    const listed = await pool.exec(profileId, { command, timeoutMs: 120_000 });
+  /** 同一个备份修剪逻辑要在 ssh2 和 openssh 两条路上都能跑，所以只依赖这两个动作。 */
+  interface RemoteRunner {
+    lines(command: string): Promise<string[]>;
+    checked(command: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }>;
+  }
+
+  function poolRunner(profileId: string, signal?: AbortSignal): RemoteRunner {
+    return {
+      async lines(command) {
+        const listed = await pool.exec(profileId, { command, timeoutMs: 120_000, signal });
+        return listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean);
+      },
+      async checked(command) {
+        const result = await pool.exec(profileId, { command, timeoutMs: 120_000, signal });
+        if (result.exitCode !== 0) {
+          throw new PolicyDeniedError(`远端命令失败（退出码 ${result.exitCode}）：${result.stderr || result.stdout || command}`);
+        }
+        return result;
+      },
+    };
+  }
+
+  function opensshRunner(profile: HostProfile, signal?: AbortSignal): RemoteRunner {
+    return {
+      async lines(command) {
+        const listed = await execOpenSsh(profile, { command, signal });
+        return listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean);
+      },
+      async checked(command) {
+        const result = await execOpenSsh(profile, { command, signal });
+        if (result.exitCode !== 0) {
+          throw new PolicyDeniedError(`远端命令失败（退出码 ${result.exitCode}）：${result.stderr || result.stdout || command}`);
+        }
+        return result;
+      },
+    };
+  }
+
+  /**
+   * 按主机的 transport 选执行/上传路径。部署与回滚都走这里，
+   * 不能无条件 `connect()` + `pool.*`：那会把 openssh 主机（ProxyJump/agent/证书）
+   * 静默改走 ssh2 直连，把 FTP 主机错报成 ECONNREFUSED。
+   */
+  async function runnerFor(host: HostProfile, signal?: AbortSignal) {
+    if (host.transport === "ftp" || host.transport === "ftps") {
+      throw new UnsupportedError(`${host.name} 是 FTP/FTPS，只能传文件，不能部署或回滚。请用 SSH/SFTP 主机。`);
+    }
+    if (host.transport === "openssh") {
+      const ready = await resolveProfile(host);
+      return {
+        runner: opensshRunner(ready, signal),
+        put: (localPath: string, remotePath: string) => scpPutVerified(ready, localPath, remotePath, signal),
+      };
+    }
+    await connect(host);
+    return {
+      runner: poolRunner(host.id, signal),
+      put: (localPath: string, remotePath: string) => pool.put(host.id, { localPath, remotePath, signal }),
+    };
+  }
+
+  async function remoteLines(profileId: string, command: string, signal?: AbortSignal): Promise<string[]> {
+    const listed = await pool.exec(profileId, { command, timeoutMs: 120_000, signal });
     return listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean);
   }
 
-  async function checked(profileId: string, command: string) {
-    const result = await pool.exec(profileId, { command, timeoutMs: 120_000 });
+  async function checked(profileId: string, command: string, signal?: AbortSignal) {
+    const result = await pool.exec(profileId, { command, timeoutMs: 120_000, signal });
     if (result.exitCode !== 0) {
       throw new PolicyDeniedError(`远端命令失败（退出码 ${result.exitCode}）：${result.stderr || result.stdout || command}`);
     }
     return result;
   }
 
-  async function pruneBackups(profileId: string, backupPath: string): Promise<void> {
+  /** 同一路径只留最近 3 份备份。删的范围限制在备份所在目录。 */
+  async function pruneBackups(runner: RemoteRunner, backupPath: string): Promise<void> {
     const slash = backupPath.lastIndexOf("/");
     if (slash < 0) return;
     const dir = backupPath.slice(0, slash);
     const name = backupPath.slice(slash + 1);
     const stamp = name.lastIndexOf(".");
     const stem = stamp > 0 ? name.slice(0, stamp) : name;
-    const names = await remoteLines(profileId, `ls -1 ${shellQuote(dir)} 2>/dev/null || true`);
+    const names = await runner.lines(`ls -1 ${shellQuote(dir)} 2>/dev/null || true`);
     for (const old of staleBackups(names, stem)) {
-      await checked(profileId, `rm -f ${shellQuote(`${dir}/${old}`)}`);
+      await runner.checked(`rm -f ${shellQuote(`${dir}/${old}`)}`);
     }
   }
 
@@ -212,19 +302,13 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       if (isProdHost(host)) throw new PolicyDeniedError("生产主机不能授予会话级写授权。");
       grants.set(host.id, Date.now() + minutes * 60_000);
     },
-    async testHost(input: { host?: string; acceptNewHostKey?: boolean }) {
-      const host = concrete(selectHost(hosts(), input.host));
-      const started = Date.now();
-      const identity = await connect(host, input.acceptNewHostKey === true);
-      const result = await pool.exec(host.id, { command: "echo ok" });
-      return {
-        ok: result.exitCode === 0,
-        auth: identity.auth,
-        fingerprint: identity.fingerprint,
-        keyType: identity.keyType,
-        latencyMs: Date.now() - started,
-        transport: host.transport,
-      };
+    async testHost(input: { host?: string; acceptNewHostKey?: boolean; allowActive?: boolean }) {
+      const host = concrete(selectHost(hosts(), input.host, input.allowActive === true));
+      return testProfile(host, input.acceptNewHostKey === true);
+    },
+    /** 测一个还没入库的候选。建连必须发生在写盘之前。 */
+    async testProfile(candidate: HostProfile, acceptNewHostKey = false) {
+      return testProfile(concrete(candidate), acceptNewHostKey);
     },
     async exec(input: { host?: string; command: string; cwd?: string; timeoutSec?: number; signal?: AbortSignal; reason?: string; waitFor?: WaitFor; onData?: (chunk: string) => void; allowActive?: boolean; ui?: ConfirmUi }) {
       const file = hosts();
@@ -320,18 +404,23 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       const host = concrete(selectHost(file, input.host));
       if (policyOf(file).readonly) throw new PolicyDeniedError("只读模式拒绝上传。");
       const backupPath = backupLocation(input.remotePath, host.deploy?.root);
-      const exists = host.transport === "openssh"
-        ? (await execOpenSsh(host, { command: `if [ -e ${shellQuote(input.remotePath)} ]; then echo yes; fi` })).stdout.includes("yes")
-        : false;
+      let exists = false;
       if (host.transport === "ftp" || host.transport === "ftps") {
-        if (isProdHost(host)) await ask(input.ui, `${host.name}：上传`, `${input.localPath} -> ${input.remotePath}`);
-        const result = await ftpPut(withPassword(host), input.localPath, input.remotePath, true);
-        appendAudit(auditPath, { host: host.name, tool: "ssh_put", danger: "write", summary: "FTP 上传", command: input.remotePath, confirmed: isProdHost(host) });
+        // FTP 也要走 resolveProfile：`file:...#name` 与 keychain 引用必须先换成明文。
+        const ready = await resolveProfile(host);
+        exists = await ftpExists(ready, input.remotePath);
+        if (isProdHost(host) || exists) {
+          await ask(input.ui, `${host.name}：上传${exists ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
+        }
+        const result = await ftpPut(ready, input.localPath, input.remotePath, exists);
+        appendAudit(auditPath, { host: host.name, tool: "ssh_put", danger: "write", summary: exists ? "FTP 覆盖上传" : "FTP 上传", command: input.remotePath, confirmed: isProdHost(host) || exists });
         return { bytes: result.bytes, sha256: "local-only", backupPath: result.backupPath };
       }
       if (host.transport === "openssh") {
+        exists = (await execOpenSsh(host, { command: `if [ -e ${shellQuote(input.remotePath)} ]; then echo yes; fi` })).stdout.includes("yes");
         if (isProdHost(host) || exists) await ask(input.ui, `${host.name}：上传${exists ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
         const result = await putOpenSsh(host, input.localPath, input.remotePath, exists ? backupPath : undefined);
+        if (exists && result.backupPath) await pruneBackups(opensshRunner(host), result.backupPath);
         appendAudit(auditPath, { host: host.name, tool: "ssh_put", danger: "write", summary: "scp 上传", command: input.remotePath, confirmed: isProdHost(host) || exists });
         return result;
       }
@@ -342,7 +431,7 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         await ask(input.ui, `${host.name}：上传${overwrite ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
       }
       const result = await pool.put(host.id, { localPath: input.localPath, remotePath: input.remotePath, backupPath: overwrite ? backupPath : undefined, onProgress: input.onProgress });
-      if (overwrite && result.backupPath) await pruneBackups(host.id, result.backupPath);
+      if (overwrite && result.backupPath) await pruneBackups(poolRunner(host.id), result.backupPath);
       appendAudit(auditPath, {
         host: host.name,
         tool: "ssh_put",
@@ -356,18 +445,24 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
     async list(input: { host?: string; path: string }) {
       const host = concrete(selectHost(hosts(), input.host));
       if (host.transport === "ftp" || host.transport === "ftps") {
-        const entries = await ftpList(withPassword(host), input.path);
+        const entries = await ftpList(await resolveProfile(host), input.path);
         return entries.map((entry) => `${entry.directory ? "d" : "-"} ${entry.size}\t${entry.name}`).join("\n");
       }
-      if (host.transport === "openssh") throw new UnsupportedError("系统 ssh 传输暂不支持列目录，请把这台主机的传输改成 ssh2。");
+      if (host.transport === "openssh") {
+        const entries = await listOpenSsh(await resolveProfile(host), input.path);
+        return entries.map((entry) => `${entry.directory ? "d" : "-"} ${entry.size}\t${entry.name}`).join("\n");
+      }
       await connect(host);
       const entries = await pool.list(host.id, input.path);
       return entries.map((entry) => `${entry.directory ? "d" : "-"} ${entry.size}\t${entry.name}`).join("\n");
     },
     async read(input: { host?: string; path: string; offset?: number; limit?: number }) {
       const host = concrete(selectHost(hosts(), input.host));
-      if (host.transport === "ftp" || host.transport === "ftps" || host.transport === "openssh") {
-        throw new UnsupportedError("读取文件目前只走 ssh2。FTP 和 openssh 请改用 ssh_get。");
+      if (host.transport === "ftp" || host.transport === "ftps") {
+        throw new UnsupportedError("FTP 不能按行读，请用 ssh_get 拉回本地再读。");
+      }
+      if (host.transport === "openssh") {
+        return readOpenSsh(await resolveProfile(host), input.path, input.offset, input.limit);
       }
       await connect(host);
       return pool.read(host.id, input.path, input.offset, input.limit);
@@ -379,6 +474,8 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       releaseId?: string;
       dryRun?: boolean;
       reason?: string;
+      signal?: AbortSignal;
+      onStep?: (message: string) => void;
       ui?: ConfirmUi;
     }) {
       const file = hosts();
@@ -386,6 +483,7 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       if (policyOf(file).readonly) throw new PolicyDeniedError("只读模式拒绝部署。");
       const layout = host.deploy;
       if (!layout?.root) throw new PolicyDeniedError(`${host.name} 没有 deploy 布局。先在主机配置里写 root，不接受调用时临时给路径。`);
+      const signal = input.signal;
       const releaseId = input.releaseId ?? releaseIdNow();
       checkReleaseId(releaseId);
       const fileName = input.localPath.split(/[\\/]/).pop() || "artifact";
@@ -396,9 +494,16 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       requireReason(host, "destructive", input.reason);
       if (input.dryRun) return { releaseId, current: plan.releaseDir, rolledBack: false, dryRun: true, plan };
       await connect(host);
-      const existing = await remoteLines(host.id, `ls -1 ${shellQuote(plan.releasesDir)} 2>/dev/null || true`);
+      const step = (message: string) => input.onStep?.(message);
+      step("读当前版本与磁盘空间");
+      // 先读到上一版，确认框里列的「将删除」才不会把回滚点算进去。
+      const previous = (await remoteLines(host.id, `readlink ${shellQuote(plan.currentLink)} || true`, signal))[0] ?? "";
+      const existing = await remoteLines(host.id, `ls -1 ${shellQuote(plan.releasesDir)} 2>/dev/null || true`, signal);
       const keep = layout.keepReleases ?? 5;
-      const doomed = existing.filter((item) => item !== releaseId).sort().slice(0, Math.max(0, existing.length + 1 - keep));
+      const doomed = existing
+        .filter((item) => item !== releaseId && !previous.endsWith(`/${item}`))
+        .sort()
+        .slice(0, Math.max(0, existing.length + 1 - keep));
       await ask(
         input.ui,
         `${host.name}：部署 ${releaseId}`,
@@ -421,41 +526,61 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       }, { required: isProdHost(host) });
       const bytes = statSync(input.localPath).size;
       const factor = kind === "tar" ? 3 : 2;
-      const space = await checked(host.id, `df -Pk ${shellQuote(layout.root)} | awk 'NR==2 { print $4 }'`);
+      const space = await checked(host.id, `df -Pk ${shellQuote(layout.root)} | awk 'NR==2 { print $4 }'`, signal);
       const freeKb = Number(space.stdout.trim());
       if (!Number.isFinite(freeKb)) throw new PolicyDeniedError(`读不到 ${layout.root} 的剩余空间，取消部署。`);
       if (freeKb * 1024 < bytes * factor) {
         throw new PolicyDeniedError(`${layout.root} 剩余 ${freeKb}KB，小于制品的 ${factor} 倍，取消部署。`);
       }
-      await checked(host.id, `mkdir -p ${shellQuote(plan.sharedDir)} ${shellQuote(plan.releaseDir)}`);
-      const previous = (await checked(host.id, `readlink ${shellQuote(plan.currentLink)} || true`)).stdout.trim();
+      step("创建目录");
+      await checked(host.id, `mkdir -p ${shellQuote(plan.sharedDir)} ${shellQuote(plan.releaseDir)}`, signal);
+      step(`上传 ${bytes} 字节`);
       if (kind === "tar") {
-        await pool.put(host.id, { localPath: input.localPath, remotePath: plan.partPath });
-        const listed = await checked(host.id, `tar -tzf ${shellQuote(plan.partPath)}`);
+        await pool.put(host.id, { localPath: input.localPath, remotePath: plan.partPath, signal });
+        const listed = await checked(host.id, `tar -tzf ${shellQuote(plan.partPath)}`, signal);
         const rejected = rejectArchiveMembers(listed.stdout.split(/\n/), plan.releaseDir);
         if (rejected.length > 0) throw new BoundsError(`压缩包成员越界：${rejected.join(", ")}`);
-        await checked(host.id, `tar -xzf ${shellQuote(plan.partPath)} -C ${shellQuote(plan.releaseDir)} && rm -f ${shellQuote(plan.partPath)}`);
+        await checked(host.id, `tar -xzf ${shellQuote(plan.partPath)} -C ${shellQuote(plan.releaseDir)} && rm -f ${shellQuote(plan.partPath)}`, signal);
       } else {
-        await pool.put(host.id, { localPath: input.localPath, remotePath: `${plan.releaseDir}/${fileName}` });
+        await pool.put(host.id, { localPath: input.localPath, remotePath: `${plan.releaseDir}/${fileName}`, signal });
       }
-      await checked(host.id, `ln -sfn ${shellQuote(plan.releaseDir)} ${shellQuote(plan.currentLink)}`);
-      if (restartCmd) await checked(host.id, restartCmd);
+      step("切换 current");
+      await checked(host.id, `ln -sfn ${shellQuote(plan.releaseDir)} ${shellQuote(plan.currentLink)}`, signal);
+      if (restartCmd) {
+        step(`重启：${restartCmd}`);
+        await checked(host.id, restartCmd, signal);
+      }
       let rolledBack = false;
       if (healthCmd) {
-        const health = await pool.exec(host.id, { command: `${healthCmd}; exit $?` });
+        step("健康检查");
+        const health = await pool.exec(host.id, { command: healthLoopCommand(healthCmd), signal });
         if (health.exitCode !== 0) {
-          if (!previous) throw new PolicyDeniedError(`健康检查失败，而且没有上一版可切回。当前停在 ${plan.releaseDir}`);
-          await checked(host.id, `ln -sfn ${shellQuote(previous)} ${shellQuote(plan.currentLink)}`);
-          if (restartCmd) await checked(host.id, restartCmd);
-          const again = await pool.exec(host.id, { command: healthCmd });
-          if (again.exitCode !== 0) throw new PolicyDeniedError(`已切回 ${previous}，但健康检查仍然失败。`);
+          if (!previous) throw new PolicyDeniedError(`健康检查失败，而且没有上一版可切回。当前停在 ${plan.releaseDir}\n${health.stdout}${health.stderr}`);
+          step("健康检查失败，切回上一版");
+          await checked(host.id, `ln -sfn ${shellQuote(previous)} ${shellQuote(plan.currentLink)}`, signal);
+          if (restartCmd) await checked(host.id, restartCmd, signal);
+          const again = await pool.exec(host.id, { command: healthLoopCommand(healthCmd), signal });
+          if (again.exitCode !== 0) {
+            const state = await pool.exec(host.id, {
+              command: `readlink ${shellQuote(plan.currentLink)}`,
+              signal,
+            });
+            throw new PolicyDeniedError(
+              `已切回 ${previous}，但健康检查仍然失败，两个版本都不健康。\n` +
+              `current -> ${state.stdout.trim() || "未知"}\n` +
+              `新版本 ${plan.releaseDir}：${health.stdout}${health.stderr}\n` +
+              `上一版本 ${previous}：${again.stdout}${again.stderr}`,
+            );
+          }
           rolledBack = true;
         }
       }
-      for (const old of doomed) {
-        if (previous.endsWith(`/${old}`)) continue;
-        checkReleaseId(old);
-        await checked(host.id, `rm -rf ${shellQuote(`${plan.releasesDir}/${old}`)}`);
+      if (doomed.length > 0) {
+        step(`清理旧版本：${doomed.join("、")}`);
+        for (const old of doomed) {
+          checkReleaseId(old);
+          await checked(host.id, `rm -rf ${shellQuote(`${plan.releasesDir}/${old}`)}`, signal);
+        }
       }
       return { releaseId, current: rolledBack ? previous : plan.releaseDir, rolledBack };
     },
@@ -478,20 +603,18 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       const plan = planRelease(host.deploy!, input.to && input.to !== "previous" ? input.to : "placeholder", "artifact");
       await connect(host);
       const current = (await pool.exec(host.id, { command: `readlink ${shellQuote(plan.currentLink)} || true` })).stdout.trim();
-      const listed = await pool.exec(host.id, { command: `ls -1 ${shellQuote(root + "/releases")}` });
+      const listed = await pool.exec(host.id, { command: `ls -1 ${shellQuote(plan.releasesDir)}` });
       const releases = listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean).sort();
       const target = input.to && input.to !== "previous"
         ? input.to
         : releases.filter((item) => !current.endsWith(`/${item}`)).at(-1);
       if (!target) throw new PolicyDeniedError("没有可回滚的上一版。");
       checkReleaseId(target);
-      const releaseDir = `${root}/releases/${target}`;
+      const releaseDir = `${plan.releasesDir}/${target}`;
       await ask(input.ui, `${host.name}：回滚到 ${target}`, [
         `${plan.currentLink} -> ${releaseDir}`,
         restartCmd ? `重启：${restartCmd}` : "没有重启命令",
       ].join("\n"));
-      await pool.exec(host.id, { command: `ln -sfn ${shellQuote(releaseDir)} ${shellQuote(plan.currentLink)}` });
-      if (restartCmd) await pool.exec(host.id, { command: restartCmd });
       appendAudit(auditPath, {
         host: host.name,
         tool: "ssh_rollback",
@@ -500,6 +623,8 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         command: releaseDir,
         confirmed: true,
       }, { required: isProdHost(host) });
+      await checked(host.id, `ln -sfn ${shellQuote(releaseDir)} ${shellQuote(plan.currentLink)}`);
+      if (restartCmd) await checked(host.id, restartCmd);
       return { releaseId: target, current: releaseDir };
     },
     async tunnel(input: { host?: string; listenPort: number; destHost: string; destPort: number; direction?: "local" | "remote"; ui?: ConfirmUi }) {
@@ -533,7 +658,7 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
     async get(input: { host?: string; remotePath: string; localPath: string }) {
       const host = concrete(selectHost(hosts(), input.host));
       if (host.transport === "ftp" || host.transport === "ftps") {
-        const result = await ftpGet(withPassword(host), input.remotePath, input.localPath);
+        const result = await ftpGet(await resolveProfile(host), input.remotePath, input.localPath);
         appendAudit(auditPath, { host: host.name, tool: "ssh_get", danger: "read", summary: "FTP 下载", command: input.remotePath });
         return { bytes: result.bytes, sha256: "local-only" };
       }
