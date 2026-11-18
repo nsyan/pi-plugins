@@ -1,6 +1,6 @@
 {
   "name": "@nsyan/db",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "description": "AI 数据库接入扩展 for pi coding agent：PostgreSQL/MySQL/Oracle/达梦DM/Redis/Elasticsearch/MongoDB/Neo4j/Hive/Spark 十种数据库，查询/表结构/扫描建连/安全管控 | Database tools for the pi agent: query, schema, scan-and-connect for 10 databases",
   "keywords": [
     "pi-extension",
@@ -31,7 +31,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nsyan/pi-plugins.git"
+    "url": "git+https://github.com/nsyan/pi-plugins.git",
+    "directory": "packages/db"
+  },
+  "homepage": "https://github.com/nsyan/pi-plugins/tree/main/packages/db#readme",
+  "bugs": {
+    "url": "https://github.com/nsyan/pi-plugins/issues"
   },
   "license": "MIT",
   "engines": {

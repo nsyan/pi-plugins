@@ -18,7 +18,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nsyan/pi-plugins.git"
+    "url": "git+https://github.com/nsyan/pi-plugins.git",
+    "directory": "packages/ssh"
+  },
+  "homepage": "https://github.com/nsyan/pi-plugins/tree/main/packages/ssh#readme",
+  "bugs": {
+    "url": "https://github.com/nsyan/pi-plugins/issues"
   },
   "license": "MIT",
   "engines": {

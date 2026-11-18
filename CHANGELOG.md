@@ -2,6 +2,13 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [db 1.3.8] - 2026-11-19
+
+### Fixed（packages/db）—— 真机测试抓到的 P0
+
+- **`EXPLAIN ANALYZE <DML>` 在 `confirm_before_exec=never` 下会被直接执行**：`EXPLAIN` 属于读白名单首关键字，`isHighRiskStatement` 于是走了「读语句副作用」分支，而该分支没有 `EXPLAIN ANALYZE` 规则 → `highRisk=false` → never 策略直执行。**`EXPLAIN ANALYZE DELETE/UPDATE` 会真正执行删除与更新**。只读模式（`isAllowed` 内的 `isWriteStatement`）拦得住，所以纯单测没暴露；必须断言「可写 + never」这条路径才能复现。现已把 `EXPLAIN` 单列进高风险判定
+- **测试**：`sql-write-detection.test.ts` 新增「EXPLAIN ANALYZE：可写模式下也不得直执行」三组用例（含 `EXPLAIN (ANALYZE, BUFFERS)` 变体、`EXPLAIN <SELECT>` 不误伤、普通 DML 豁免未被误扩大），测试 235 → 238
+
 ## [db 1.3.7] - 2026-11-19
 
 ### Security（packages/db）—— 只读模式真的拦得住写

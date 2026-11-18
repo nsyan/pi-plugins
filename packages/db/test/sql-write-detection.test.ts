@@ -1,4 +1,4 @@
-// test/sql-write-detection.test.ts —— 读写判定白名单回归（v1.3.7）
+// test/sql-write-detection.test.ts —— 读写判定白名单回归（v1.3.8）
 //
 // 背景：旧实现是**写黑名单**（INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE/REPLACE/
 // LOAD/MERGE/EXEC/CALL/MSCK/CACHE/REFRESH），实测漏掉一整个批次——COPY/GRANT/SET/
@@ -11,6 +11,7 @@ import {
   isWriteStatement, isDropStatement, isHighRiskStatement, splitStatements, stripComments,
 } from "../src/core/sql-text.js";
 import { postgresqlDialect } from "../src/dialects/postgresql.js";
+import { decide } from "../src/core/policy.js";
 import { mysqlDialect } from "../src/dialects/mysql.js";
 import { hiveDialect } from "../src/dialects/hive.js";
 import { redisDialect } from "../src/dialects/redis.js";
@@ -190,7 +191,7 @@ describe("其他家族的 highRisk 口径", () => {
   });
 });
 
-// ── v1.3.7 自查回归：字面量剥离 ──────────────────────────
+// ── v1.3.8 自查回归：字面量剥离 ──────────────────────────
 // 白名单改造时把 SELECT_SIDE_EFFECTS 的匹配面扩大了，若不在判定前剥掉字符串字面量，
 // `SELECT 'FOR UPDATE' AS note`、`WHERE note = 'x INTO y'` 这类纯读会被误判成写
 // （多弹确认框、只读模式下还会直接拒绝——对只读用户是不可用的功能回归）。
@@ -225,5 +226,47 @@ describe("字面量剥离：读语句不被值内容误判", () => {
     const v = postgresqlDialect.isAllowed("INSERT INTO t VALUES ('a INTO b')", false);
     assert.equal(v.isWrite, true);
     assert.equal(v.highRisk, false); // 普通 DML，不是「SELECT INTO 建表」
+  });
+});
+
+// ── v1.3.8 真机回归：EXPLAIN ANALYZE 的 highRisk 漏判 ──────────────
+// 真机测试（pi 1.3.7 + 真实 PG）抓到：EXPLAIN 在 READ_STARTERS 里，
+// isHighRiskStatement 会走「读语句副作用」分支，而该分支没有 EXPLAIN ANALYZE 规则
+// → highRisk=false → confirm_before_exec=never 时**直接执行** `EXPLAIN ANALYZE DELETE`。
+// 只读模式（isAllowed 里的 isWriteStatement）是拦得住的，所以纯单测没暴露，
+// 必须同时断言「可写 + never」这条路径。
+describe("EXPLAIN ANALYZE：可写模式下也不得直执行", () => {
+  const never = (sql: string) => {
+    const v = postgresqlDialect.isAllowed(sql, false); // 可写模式
+    return { verdict: v, action: decide(v, false, "never", v.highRisk === true) };
+  };
+
+  it("EXPLAIN ANALYZE <DML> 在 never 策略下仍要确认", () => {
+    for (const sql of [
+      "EXPLAIN ANALYZE DELETE FROM t",
+      "EXPLAIN ANALYZE UPDATE t SET a = 1",
+      "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+      "EXPLAIN (ANALYZE, BUFFERS) DELETE FROM t",
+    ]) {
+      const { verdict, action } = never(sql);
+      assert.equal(verdict.isWrite, true, `应判为写: ${sql}`);
+      assert.equal(verdict.highRisk, true, `应判为高风险: ${sql}`);
+      assert.equal(action, "confirm", `never 策略下仍须确认: ${sql}`);
+    }
+  });
+
+  it("EXPLAIN <SELECT> 仍是读，never 下直执行", () => {
+    for (const sql of ["EXPLAIN SELECT 1", "EXPLAIN (FORMAT JSON) SELECT * FROM t", "EXPLAIN ANALYZE SELECT 1"]) {
+      const { verdict, action } = never(sql);
+      assert.equal(verdict.isWrite, false, `应判为读: ${sql}`);
+      assert.equal(action, "run", `读语句应直执行: ${sql}`);
+    }
+  });
+
+  it("普通 DML 在 never 下仍直执行（豁免未被误扩大）", () => {
+    for (const sql of ["INSERT INTO t VALUES (1)", "UPDATE t SET a = 1", "DELETE FROM t"]) {
+      const { action } = never(sql);
+      assert.equal(action, "run", `普通 DML 应直执行: ${sql}`);
+    }
   });
 });

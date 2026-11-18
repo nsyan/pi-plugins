@@ -1,6 +1,6 @@
 // src/core/sql-text.ts —— SQL 语句切分与读写判定（关系型 / 大数据家族共用）
 //
-// 判定姿态（v1.3.7 收紧）：**读白名单**，不是写黑名单。
+// 判定姿态（v1.3.8 收紧）：**读白名单**，不是写黑名单。
 //   旧实现只认 INSERT/UPDATE/DELETE/DROP/CREATE/ALTER/TRUNCATE/REPLACE/LOAD/MERGE/
 //   EXEC/CALL/MSCK/CACHE/REFRESH 十几个词，实测漏掉一整个批次：
 //     COPY ... FROM / COPY ... TO PROGRAM、GRANT、REVOKE、SET（含解除只读）、
@@ -219,6 +219,10 @@ export function isHighRiskStatement(stmt: string): boolean {
   if (WITH_DML_RE.test(code)) return true; // CTE 里夹 DML 一律按高风险
   const kw = firstKeyword(clean);
   if (HIGH_RISK_STARTERS.has(kw)) return true;
+  // EXPLAIN ANALYZE <DML> 会**真的执行**被分析的语句——它虽然首关键字在 READ_STARTERS 里，
+  // 但绝不能落到下面的「读语句副作用」分支（那里没有这条规则，会得出 highRisk=false，
+  // 在 confirm_before_exec=never 下直接执行删除/更新）。这是 v1.3.8 真机测试抓到的漏洞。
+  if (kw === "EXPLAIN") return EXPLAIN_ANALYZE_DML_RE.test(code);
   // 读外壳下的写副作用（INTO OUTFILE / 副作用函数）同样按高风险。
   // 注：只在读类首关键字上判——否则 `INSERT INTO t ...` 会被 INTO 误命中成「SELECT INTO 建表」
   if (READ_STARTERS.has(kw)) return SELECT_SIDE_EFFECTS.some((re) => re.test(code));
