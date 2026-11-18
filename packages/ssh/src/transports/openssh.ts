@@ -147,6 +147,19 @@ export async function readOpenSsh(profile: HostProfile, remotePath: string, offs
   }
 }
 
+/**
+ * OpenSSH 对老服务器会打一串 post-quantum 警告。它是 ssh 自己的提示，
+ * 不是命令的输出；合进结果里会让「退出码 0」看起来像出错。
+ */
+export function stripSshNoise(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/WARNING: connection is not using a post-quantum key exchange algorithm/.test(line))
+    .filter((line) => !/This session may be vulnerable to "store now, decrypt later" attacks/.test(line))
+    .filter((line) => !/The server may need to be upgraded\. See https:\/\/openssh\.com\/pq\.html/.test(line))
+    .join("\n");
+}
+
 export interface OpenSshRequest {
   command: string;
   cwd?: string;
@@ -191,7 +204,7 @@ export function execOpenSsh(profile: HostProfile, request: OpenSshRequest): Prom
     child.on("close", (code) => {
       clearTimeout(timer);
       request.signal?.removeEventListener("abort", abort);
-      resolve({ stdout, stderr, exitCode: code, durationMs: Date.now() - started });
+      resolve({ stdout, stderr: stripSshNoise(stderr), exitCode: code, durationMs: Date.now() - started });
     });
   });
 }
@@ -227,6 +240,21 @@ export async function scpPutVerified(profile: HostProfile, localPath: string, re
   const remote = parseRemoteHash(checked.stdout);
   if (checked.exitCode !== 0 || remote !== local.hash) {
     throw new TransferMismatchError(`sha256 不一致：本地 ${local.hash}，远端 ${remote ?? "无"}。${remotePath} 保留，原文件未动`);
+  }
+  return { bytes: local.bytes, sha256: local.hash };
+}
+
+/**
+ * scp 下载后做双端 sha256 比对。scp 退出码 0 不代表内容完整，
+ * 传输中断、磁盘满、服务端限流都可能静默截断。
+ */
+export async function getOpenSsh(profile: HostProfile, remotePath: string, localPath: string): Promise<{ bytes: number; sha256: string }> {
+  await copyOpenSsh(profile, "get", localPath, remotePath);
+  const local = await sha256File(localPath);
+  const checked = await execOpenSsh(profile, { command: remoteHashCommand(remotePath) });
+  const remote = parseRemoteHash(checked.stdout);
+  if (checked.exitCode !== 0 || remote !== local.hash) {
+    throw new TransferMismatchError(`下载后 sha256 不一致：本地 ${local.hash}，远端 ${remote ?? "无"}。${localPath} 可能不完整`);
   }
   return { bytes: local.bytes, sha256: local.hash };
 }

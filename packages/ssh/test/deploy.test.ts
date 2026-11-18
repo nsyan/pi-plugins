@@ -68,3 +68,23 @@ describe("rejectArchiveMembers", () => {
     assert.deepEqual(rejectArchiveMembers("dist/app.js\ndist/assets/\n".split(/\n/), "/srv/app/releases/1"), []);
   });
 });
+
+describe("rejectArchiveMembers 空行", () => {
+  it("tar -tzf 末尾空行不算越界成员", () => {
+    // tar 输出总以换行结尾，split 后最后一项是空串
+    const listed = "ok.txt\napp/\napp/i.html\n".split(/\n/);
+    assert.deepEqual(rejectArchiveMembers(listed, "/srv/app/releases/1"), []);
+  });
+
+  it("真越界成员照旧被点名，不被空行掩盖", () => {
+    const listed = "ok.txt\n../escape\n/etc/passwd\n".split(/\n/);
+    assert.deepEqual(rejectArchiveMembers(listed, "/srv/app/releases/1"), ["../escape", "/etc/passwd"]);
+  });
+});
+
+describe("staleBackups 与备份目录", () => {
+  it("部署根内收进 .pi-ssh-backup，根外留在同目录", () => {
+    assert.equal(backupLocation("/srv/app/web/index.html", "/srv/app", 123), "/srv/app/.pi-ssh-backup/web/index.html.123");
+    assert.equal(backupLocation("/tmp/x.txt", "/srv/app", 123), "/tmp/x.txt.bak.123");
+  });
+});

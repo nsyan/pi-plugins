@@ -36,3 +36,22 @@ describe("parseSftpLongNames", () => {
     assert.deepEqual(parseSftpLongNames(""), []);
   });
 });
+
+describe("ssh 噪音过滤", () => {
+  it("过滤 post-quantum 警告，保留真实 stderr", async () => {
+    const { stripSshNoise } = await import("../src/transports/openssh.js");
+    const noisy = [
+      "** WARNING: connection is not using a post-quantum key exchange algorithm.",
+      '** This session may be vulnerable to "store now, decrypt later" attacks.',
+      "** The server may need to be upgraded. See https://openssh.com/pq.html",
+      "real error: permission denied",
+    ].join("\r\n");
+    assert.equal(stripSshNoise(noisy), "real error: permission denied");
+  });
+
+  it("没有噪音时原样返回", async () => {
+    const { stripSshNoise } = await import("../src/transports/openssh.js");
+    assert.equal(stripSshNoise("plain"), "plain");
+    assert.equal(stripSshNoise(""), "");
+  });
+});

@@ -6,7 +6,7 @@ import { appendAudit, defaultAuditPath } from "./core/audit.js";
 import { backupLocation, checkReleaseId, healthLoopCommand, planRelease, rejectArchiveMembers, releaseIdNow, staleBackups } from "./core/deploy.js";
 import { waitCommand, type WaitFor } from "./core/wait.js";
 import { loadHosts } from "./core/config.js";
-import { shellQuote } from "./core/guard.js";
+import { shellQuote, withinRoot } from "./core/guard.js";
 import { getSecret, platformKeychain } from "./core/secrets.js";
 import { appendKnownHost, checkHostKey, hostKeyFingerprint } from "./core/known-hosts.js";
 import { classify, decide, isProdHost, type Policy } from "./core/policy.js";
@@ -23,7 +23,7 @@ import {
 } from "./core/types.js";
 import { Ssh2Pool, type ConnectHooks } from "./transports/ssh2.js";
 import { chooseTransport } from "./scan/auto.js";
-import { copyOpenSsh, execOpenSsh, listOpenSsh, putOpenSsh, readOpenSsh } from "./transports/openssh.js";
+import { copyOpenSsh, execOpenSsh, getOpenSsh, listOpenSsh, putOpenSsh, readOpenSsh, scpPutVerified } from "./transports/openssh.js";
 import { ftpExecRejected, ftpExists, ftpGet, ftpList, ftpPut } from "./transports/ftp.js";
 
 const OUTPUT_LIMIT = 50_000;
@@ -148,6 +148,8 @@ export function createRuntime(options: RuntimeOptions = {}) {
     await pool.connect(ready, hooks).catch((error: Error) => {
       throw keyError ?? error;
     });
+    // 连接复用时 hostVerifier 不会再跑，指纹要从池里取回来。
+    if (!identity.fingerprint) identity.fingerprint = pool.fingerprintOf(ready.id);
     return identity;
   }
 
@@ -188,36 +190,46 @@ export function createRuntime(options: RuntimeOptions = {}) {
   interface RemoteRunner {
     lines(command: string): Promise<string[]>;
     checked(command: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }>;
+    /** 不抛错的版本：调用方要自己看退出码（健康检查、重启这类需要分支处理的）。 */
+    tryRun(command: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }>;
   }
 
   function poolRunner(profileId: string, signal?: AbortSignal): RemoteRunner {
+    const run = (command: string) => pool.exec(profileId, { command, timeoutMs: 120_000, signal });
     return {
       async lines(command) {
-        const listed = await pool.exec(profileId, { command, timeoutMs: 120_000, signal });
+        const listed = await run(command);
         return listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean);
       },
       async checked(command) {
-        const result = await pool.exec(profileId, { command, timeoutMs: 120_000, signal });
+        const result = await run(command);
         if (result.exitCode !== 0) {
           throw new PolicyDeniedError(`远端命令失败（退出码 ${result.exitCode}）：${result.stderr || result.stdout || command}`);
         }
         return result;
+      },
+      async tryRun(command) {
+        return run(command).catch((error: Error) => ({ stdout: "", stderr: error.message, exitCode: 1 }));
       },
     };
   }
 
   function opensshRunner(profile: HostProfile, signal?: AbortSignal): RemoteRunner {
+    const run = (command: string) => execOpenSsh(profile, { command, signal });
     return {
       async lines(command) {
-        const listed = await execOpenSsh(profile, { command, signal });
+        const listed = await run(command);
         return listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean);
       },
       async checked(command) {
-        const result = await execOpenSsh(profile, { command, signal });
+        const result = await run(command);
         if (result.exitCode !== 0) {
           throw new PolicyDeniedError(`远端命令失败（退出码 ${result.exitCode}）：${result.stderr || result.stdout || command}`);
         }
         return result;
+      },
+      async tryRun(command) {
+        return run(command).catch((error: Error) => ({ stdout: "", stderr: error.message, exitCode: 1 }));
       },
     };
   }
@@ -357,18 +369,23 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         ? result.spillPath
         : undefined;
       const output = tail(`${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`, spill);
-      appendAudit(auditPath, {
-        host: host.name,
-        tool: "ssh_exec",
-        danger: verdict.danger,
-        summary: verdict.summary,
-        command: input.command,
-        reason: input.reason,
-        confirmed: decision === "confirm",
-        exitCode: result.exitCode,
-        durationMs: result.durationMs,
-      });
-      return { ...result, text: output.text, truncated: output.truncated };
+      // 生产主机的 destructive 已经在动作之前写过一条（fail-closed），
+      // 这里再写会变成一次动作两条记录，`/ssh log` 会双计。
+      const alreadyAudited = isProdHost(host) && verdict.danger === "destructive";
+      if (!alreadyAudited) {
+        appendAudit(auditPath, {
+          host: host.name,
+          tool: "ssh_exec",
+          danger: verdict.danger,
+          summary: verdict.summary,
+          command: input.command,
+          reason: input.reason,
+          confirmed: decision === "confirm",
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+        });
+      }
+      return { ...result, text: output.text, truncated: output.truncated, spillPath: output.spillPath };
     },
     async sudo(input: { host?: string; command: string; reason?: string; ui?: ConfirmUi }) {
       const file = hosts();
@@ -397,7 +414,7 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         timeoutMs: boundedTimeoutMs(undefined, host.defaults?.timeoutSec),
       });
       const output = tail(`${result.stdout}${result.stderr ? `\n${result.stderr}` : ""}`, result.spillPath);
-      return { ...result, text: output.text };
+      return { ...result, text: output.text, truncated: output.truncated, spillPath: output.spillPath };
     },
     async put(input: { host?: string; localPath: string; remotePath: string; ui?: ConfirmUi; onProgress?: (sent: number, total: number) => void }) {
       const file = hosts();
@@ -413,7 +430,17 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
           await ask(input.ui, `${host.name}：上传${exists ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
         }
         const result = await ftpPut(ready, input.localPath, input.remotePath, exists);
-        appendAudit(auditPath, { host: host.name, tool: "ssh_put", danger: "write", summary: exists ? "FTP 覆盖上传" : "FTP 上传", command: input.remotePath, confirmed: isProdHost(host) || exists });
+        appendAudit(auditPath, {
+          host: host.name,
+          tool: "ssh_put",
+          danger: "write",
+          summary: exists ? "FTP 覆盖上传" : "FTP 上传",
+          command: `${input.localPath} -> ${input.remotePath}`,
+          confirmed: isProdHost(host) || exists,
+          bytes: result.bytes,
+          sha256: "local-only",
+          backupPath: result.backupPath,
+        });
         return { bytes: result.bytes, sha256: "local-only", backupPath: result.backupPath };
       }
       if (host.transport === "openssh") {
@@ -421,7 +448,17 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         if (isProdHost(host) || exists) await ask(input.ui, `${host.name}：上传${exists ? "并覆盖" : ""}`, `${input.localPath} -> ${input.remotePath}`);
         const result = await putOpenSsh(host, input.localPath, input.remotePath, exists ? backupPath : undefined);
         if (exists && result.backupPath) await pruneBackups(opensshRunner(host), result.backupPath);
-        appendAudit(auditPath, { host: host.name, tool: "ssh_put", danger: "write", summary: "scp 上传", command: input.remotePath, confirmed: isProdHost(host) || exists });
+        appendAudit(auditPath, {
+          host: host.name,
+          tool: "ssh_put",
+          danger: "write",
+          summary: exists ? "scp 覆盖上传" : "scp 上传",
+          command: `${input.localPath} -> ${input.remotePath}`,
+          confirmed: isProdHost(host) || exists,
+          bytes: result.bytes,
+          sha256: result.sha256,
+          backupPath: result.backupPath,
+        });
         return result;
       }
       await connect(host);
@@ -439,6 +476,9 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         summary: overwrite ? "覆盖远端文件" : "上传新文件",
         command: `${input.localPath} -> ${input.remotePath}`,
         confirmed: isProdHost(host) || overwrite,
+        bytes: result.bytes,
+        sha256: result.sha256,
+        backupPath: result.backupPath,
       });
       return result;
     },
@@ -493,12 +533,12 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       const healthCmd = layout.healthCmd;
       requireReason(host, "destructive", input.reason);
       if (input.dryRun) return { releaseId, current: plan.releaseDir, rolledBack: false, dryRun: true, plan };
-      await connect(host);
+      const remote = await runnerFor(host, signal);
       const step = (message: string) => input.onStep?.(message);
       step("读当前版本与磁盘空间");
       // 先读到上一版，确认框里列的「将删除」才不会把回滚点算进去。
-      const previous = (await remoteLines(host.id, `readlink ${shellQuote(plan.currentLink)} || true`, signal))[0] ?? "";
-      const existing = await remoteLines(host.id, `ls -1 ${shellQuote(plan.releasesDir)} 2>/dev/null || true`, signal);
+      const previous = (await remote.runner.lines(`readlink ${shellQuote(plan.currentLink)} || true`))[0] ?? "";
+      const existing = await remote.runner.lines(`ls -1 ${shellQuote(plan.releasesDir)} 2>/dev/null || true`);
       const keep = layout.keepReleases ?? 5;
       const doomed = existing
         .filter((item) => item !== releaseId && !previous.endsWith(`/${item}`))
@@ -526,60 +566,74 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       }, { required: isProdHost(host) });
       const bytes = statSync(input.localPath).size;
       const factor = kind === "tar" ? 3 : 2;
-      const space = await checked(host.id, `df -Pk ${shellQuote(layout.root)} | awk 'NR==2 { print $4 }'`, signal);
+      const space = await remote.runner.checked(`df -Pk ${shellQuote(layout.root)} | awk 'NR==2 { print $4 }'`);
       const freeKb = Number(space.stdout.trim());
       if (!Number.isFinite(freeKb)) throw new PolicyDeniedError(`读不到 ${layout.root} 的剩余空间，取消部署。`);
       if (freeKb * 1024 < bytes * factor) {
         throw new PolicyDeniedError(`${layout.root} 剩余 ${freeKb}KB，小于制品的 ${factor} 倍，取消部署。`);
       }
       step("创建目录");
-      await checked(host.id, `mkdir -p ${shellQuote(plan.sharedDir)} ${shellQuote(plan.releaseDir)}`, signal);
+      await remote.runner.checked(`mkdir -p ${shellQuote(plan.sharedDir)} ${shellQuote(plan.releaseDir)}`);
       step(`上传 ${bytes} 字节`);
       if (kind === "tar") {
-        await pool.put(host.id, { localPath: input.localPath, remotePath: plan.partPath, signal });
-        const listed = await checked(host.id, `tar -tzf ${shellQuote(plan.partPath)}`, signal);
+        await remote.put(input.localPath, plan.partPath);
+        const listed = await remote.runner.checked(`tar -tzf ${shellQuote(plan.partPath)}`);
         const rejected = rejectArchiveMembers(listed.stdout.split(/\n/), plan.releaseDir);
         if (rejected.length > 0) throw new BoundsError(`压缩包成员越界：${rejected.join(", ")}`);
-        await checked(host.id, `tar -xzf ${shellQuote(plan.partPath)} -C ${shellQuote(plan.releaseDir)} && rm -f ${shellQuote(plan.partPath)}`, signal);
+        await remote.runner.checked(`tar -xzf ${shellQuote(plan.partPath)} -C ${shellQuote(plan.releaseDir)} && rm -f ${shellQuote(plan.partPath)}`);
       } else {
-        await pool.put(host.id, { localPath: input.localPath, remotePath: `${plan.releaseDir}/${fileName}`, signal });
+        await remote.put(input.localPath, `${plan.releaseDir}/${fileName}`);
       }
       step("切换 current");
-      await checked(host.id, `ln -sfn ${shellQuote(plan.releaseDir)} ${shellQuote(plan.currentLink)}`, signal);
-      if (restartCmd) {
-        step(`重启：${restartCmd}`);
-        await checked(host.id, restartCmd, signal);
-      }
+      await remote.runner.checked(`ln -sfn ${shellQuote(plan.releaseDir)} ${shellQuote(plan.currentLink)}`);
       let rolledBack = false;
-      if (healthCmd) {
-        step("健康检查");
-        const health = await pool.exec(host.id, { command: healthLoopCommand(healthCmd), signal });
-        if (health.exitCode !== 0) {
-          if (!previous) throw new PolicyDeniedError(`健康检查失败，而且没有上一版可切回。当前停在 ${plan.releaseDir}\n${health.stdout}${health.stderr}`);
-          step("健康检查失败，切回上一版");
-          await checked(host.id, `ln -sfn ${shellQuote(previous)} ${shellQuote(plan.currentLink)}`, signal);
-          if (restartCmd) await checked(host.id, restartCmd, signal);
-          const again = await pool.exec(host.id, { command: healthLoopCommand(healthCmd), signal });
+      /**
+       * 切回上一版并重启、复检。重启失败与健康检查失败走同一条回退路径。
+       * 回退时的重启用 tryRun：重启命令本身坏了（比如写错了 systemctl 服务名），
+       * 再抛一次只会把「已回退」这个关键信息盖掉。
+       */
+      const fallback = async (why: string, detail: string) => {
+        if (!previous) throw new PolicyDeniedError(`${why}，而且没有上一版可切回。当前停在 ${plan.releaseDir}\n${detail}`);
+        step(`${why}，切回上一版`);
+        await remote.runner.checked(`ln -sfn ${shellQuote(previous)} ${shellQuote(plan.currentLink)}`);
+        const restartAgain = restartCmd ? await remote.runner.tryRun(restartCmd) : undefined;
+        if (restartAgain && restartAgain.exitCode !== 0) {
+          step(`回退后的重启命令也失败了：${restartAgain.stderr || restartAgain.stdout}`);
+        }
+        if (healthCmd) {
+          const again = await remote.runner.tryRun(healthLoopCommand(healthCmd));
           if (again.exitCode !== 0) {
-            const state = await pool.exec(host.id, {
-              command: `readlink ${shellQuote(plan.currentLink)}`,
-              signal,
-            });
+            const state = await remote.runner.tryRun(`readlink ${shellQuote(plan.currentLink)}`);
             throw new PolicyDeniedError(
               `已切回 ${previous}，但健康检查仍然失败，两个版本都不健康。\n` +
               `current -> ${state.stdout.trim() || "未知"}\n` +
-              `新版本 ${plan.releaseDir}：${health.stdout}${health.stderr}\n` +
-              `上一版本 ${previous}：${again.stdout}${again.stderr}`,
+              `新版本 ${plan.releaseDir}：${detail}\n` +
+              `上一版本 ${previous}：${again.stdout}${again.stderr}` +
+              (restartAgain && restartAgain.exitCode !== 0 ? `\n回退时的重启命令也失败：${restartAgain.stderr || restartAgain.stdout}` : ""),
             );
           }
-          rolledBack = true;
         }
+        rolledBack = true;
+      };
+      if (restartCmd) {
+        // 重启失败不能再往下走：新版本没生效，current 已经指向它。
+        step(`重启：${restartCmd}`);
+        const restarted = await remote.runner.tryRun(restartCmd);
+        if (restarted.exitCode !== 0) {
+          await fallback("重启失败", `${restarted.stdout}${restarted.stderr}`);
+          return { releaseId, current: previous, rolledBack };
+        }
+      }
+      if (healthCmd) {
+        step("健康检查");
+        const health = await remote.runner.tryRun(healthLoopCommand(healthCmd));
+        if (health.exitCode !== 0) await fallback("健康检查失败", `${health.stdout}${health.stderr}`);
       }
       if (doomed.length > 0) {
         step(`清理旧版本：${doomed.join("、")}`);
         for (const old of doomed) {
           checkReleaseId(old);
-          await checked(host.id, `rm -rf ${shellQuote(`${plan.releasesDir}/${old}`)}`, signal);
+          await remote.runner.checked(`rm -rf ${shellQuote(`${plan.releasesDir}/${old}`)}`);
         }
       }
       return { releaseId, current: rolledBack ? previous : plan.releaseDir, rolledBack };
@@ -591,29 +645,46 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       requireReason(host, "destructive", input.reason);
       if (input.file) {
         await ask(input.ui, `${host.name}：恢复文件`, input.file);
-        await connect(host);
+        const remote = await runnerFor(host);
         const quoted = shellQuote(input.file);
-        const moved = await pool.exec(host.id, { command: `latest=$(ls -1t ${quoted}.bak.* 2>/dev/null | head -1); test -n "$latest" && mv "$latest" ${quoted}` });
-        if (moved.exitCode !== 0) throw new PolicyDeniedError(`没有可用备份，或恢复 ${input.file} 失败。`);
+        // 备份可能在两个位置：部署根内的 <root>/.pi-ssh-backup/<rel>.<ts>，
+        // 或同目录的 <path>.bak.<ts>。两处都要找，否则部署根内的文件永远回滚不了。
+        const root = host.deploy?.root;
+        const candidates: string[] = [`${quoted}.bak.*`];
+        if (root && withinRoot(root, input.file)) {
+          candidates.push(shellQuote(`${root}/.pi-ssh-backup/${input.file.slice(root.length + 1)}.*`));
+        }
+        const find = `for pat in ${candidates.join(" ")}; do latest=$(ls -1t $pat 2>/dev/null | head -1); [ -n "$latest" ] && break; done`;
+        const moved = await remote.runner.checked(`${find}; test -n "$latest" && mv "$latest" ${quoted}`)
+          .catch((error: Error) => {
+            throw new PolicyDeniedError(`没有可用备份，或恢复 ${input.file} 失败。找过：${candidates.join("、")}\n${error.message}`);
+          });
+        void moved;
         return { releaseId: "", current: input.file };
       }
       const root = host.deploy?.root;
       if (!root) throw new PolicyDeniedError(`${host.name} 没有 deploy 布局，不能回滚 release。`);
       const restartCmd = host.deploy?.restartCmd;
+      const healthCmd = host.deploy?.healthCmd;
       const plan = planRelease(host.deploy!, input.to && input.to !== "previous" ? input.to : "placeholder", "artifact");
-      await connect(host);
-      const current = (await pool.exec(host.id, { command: `readlink ${shellQuote(plan.currentLink)} || true` })).stdout.trim();
-      const listed = await pool.exec(host.id, { command: `ls -1 ${shellQuote(plan.releasesDir)}` });
-      const releases = listed.stdout.split(/\n/).map((item) => item.trim()).filter(Boolean).sort();
-      const target = input.to && input.to !== "previous"
-        ? input.to
-        : releases.filter((item) => !current.endsWith(`/${item}`)).at(-1);
+      const remote = await runnerFor(host);
+      const current = (await remote.runner.lines(`readlink ${shellQuote(plan.currentLink)} || true`))[0] ?? "";
+      const listed = await remote.runner.lines(`ls -1 ${shellQuote(plan.releasesDir)}`);
+      const releases = listed.filter(Boolean).sort();
+      let target = input.to && input.to !== "previous" ? input.to : undefined;
+      if (!target) {
+        // 只认目录。部署中断会留下 `<id>.part`，它排序靠后，当 release 切上去就是 404。
+        const dirs = releases.filter((item) => !item.endsWith(".part") && !current.endsWith(`/${item}`));
+        target = dirs.at(-1);
+      }
       if (!target) throw new PolicyDeniedError("没有可回滚的上一版。");
+      if (target.endsWith(".part")) throw new PolicyDeniedError(`${target} 是上传中的 .part 残留，不是发布目录，不能回滚到它。`);
       checkReleaseId(target);
       const releaseDir = `${plan.releasesDir}/${target}`;
       await ask(input.ui, `${host.name}：回滚到 ${target}`, [
         `${plan.currentLink} -> ${releaseDir}`,
         restartCmd ? `重启：${restartCmd}` : "没有重启命令",
+        healthCmd ? "回滚后跑健康检查；不通过会报出两个版本的状态。" : "没有健康检查，回滚后不会自动验证。",
       ].join("\n"));
       appendAudit(auditPath, {
         host: host.name,
@@ -623,8 +694,18 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         command: releaseDir,
         confirmed: true,
       }, { required: isProdHost(host) });
-      await checked(host.id, `ln -sfn ${shellQuote(releaseDir)} ${shellQuote(plan.currentLink)}`);
-      if (restartCmd) await checked(host.id, restartCmd);
+      await remote.runner.checked(`ln -sfn ${shellQuote(releaseDir)} ${shellQuote(plan.currentLink)}`);
+      if (restartCmd) await remote.runner.checked(restartCmd);
+      if (healthCmd) {
+        const health = await remote.runner.checked(healthLoopCommand(healthCmd))
+          .catch((error: Error) => ({ stdout: "", stderr: error.message, exitCode: 1 }));
+        if (health.exitCode !== 0) {
+          throw new PolicyDeniedError(
+            `已切到 ${target} 但健康检查未通过。current 仍指向 ${releaseDir}，需要人工处理。\n` +
+            `${health.stdout}${health.stderr}`,
+          );
+        }
+      }
       return { releaseId: target, current: releaseDir };
     },
     async tunnel(input: { host?: string; listenPort: number; destHost: string; destPort: number; direction?: "local" | "remote"; ui?: ConfirmUi }) {
@@ -659,13 +740,30 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
       const host = concrete(selectHost(hosts(), input.host));
       if (host.transport === "ftp" || host.transport === "ftps") {
         const result = await ftpGet(await resolveProfile(host), input.remotePath, input.localPath);
-        appendAudit(auditPath, { host: host.name, tool: "ssh_get", danger: "read", summary: "FTP 下载", command: input.remotePath });
+        appendAudit(auditPath, {
+          host: host.name,
+          tool: "ssh_get",
+          danger: "read",
+          summary: "FTP 下载",
+          command: `${input.remotePath} -> ${input.localPath}`,
+          bytes: result.bytes,
+          sha256: "local-only",
+        });
         return { bytes: result.bytes, sha256: "local-only" };
       }
       if (host.transport === "openssh") {
-        await copyOpenSsh(host, "get", input.localPath, input.remotePath);
-        appendAudit(auditPath, { host: host.name, tool: "ssh_get", danger: "read", summary: "scp 下载", command: input.remotePath });
-        return { bytes: 0, sha256: "" };
+        // 下载也要双端校验：scp 成功不代表内容一致（截断、磁盘满、编码问题）。
+        const result = await getOpenSsh(host, input.remotePath, input.localPath);
+        appendAudit(auditPath, {
+          host: host.name,
+          tool: "ssh_get",
+          danger: "read",
+          summary: "scp 下载",
+          command: `${input.remotePath} -> ${input.localPath}`,
+          bytes: result.bytes,
+          sha256: result.sha256,
+        });
+        return result;
       }
       await connect(host);
       const result = await pool.get(host.id, { remotePath: input.remotePath, localPath: input.localPath });
@@ -675,6 +773,8 @@ async function ask(ui: ConfirmUi | undefined, title: string, message: string): P
         danger: "read",
         summary: "下载远端文件",
         command: `${input.remotePath} -> ${input.localPath}`,
+        bytes: result.bytes,
+        sha256: result.sha256,
       });
       return result;
     },

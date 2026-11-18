@@ -168,6 +168,15 @@ export class Ssh2Pool {
     return stored.client;
   }
 
+  /**
+   * 已建立的连接上握手阶段算过的指纹。
+   * 连接复用时 `hostVerifier` 不会再被调用，调用方拿不到指纹，
+   * 只能从这里取；否则第二次 `ssh_hosts test` 会报一个空指纹。
+   */
+  fingerprintOf(profileId: string): string {
+    return this.connections.get(profileId)?.fingerprint ?? "";
+  }
+
   /** 占一个 channel 名额。满 4 个就等。 */
   async acquire(profileId: string): Promise<Lease> {
     const stored = this.connections.get(profileId);
@@ -437,16 +446,18 @@ export class Ssh2Pool {
         let stderr = "";
         let spillPath: string | undefined;
         let finished = false;
+        const overBudget = (prospective: number, lines: number) => prospective > 50_000 || lines > 2000;
         const absorb = (which: "out" | "err", chunk: string) => {
-          const lines = stdout.split("\n").length + stderr.split("\n").length;
-          if (spillPath || stdout.length + stderr.length + chunk.length > 50_000 || lines > 2000) {
-            if (!spillPath) {
-              spillPath = join(tmpdir(), `pi-ssh-${process.pid}-${Date.now()}.log`);
-              mkdirSync(tmpdir(), { recursive: true });
-              writeFileSync(spillPath, stdout + stderr);
-            }
-            appendFileSync(spillPath, chunk);
+          // 预算看的是「加上本块之后」的总量。只看已累积量的话，
+          // 一次到达的 3001 行（~14KB）永远触发不了 2000 行上限。
+          const prospective = stdout.length + stderr.length + chunk.length;
+          const lines = `${stdout}${chunk}`.split("\n").length + stderr.split("\n").length - 1;
+          if (!spillPath && overBudget(prospective, lines)) {
+            spillPath = join(tmpdir(), `pi-ssh-${process.pid}-${Date.now()}.log`);
+            mkdirSync(tmpdir(), { recursive: true });
+            writeFileSync(spillPath, stdout + stderr);
           }
+          if (spillPath) appendFileSync(spillPath, chunk);
           if (which === "out") stdout = (stdout + chunk).slice(-50_000);
           else stderr = (stderr + chunk).slice(-50_000);
         };

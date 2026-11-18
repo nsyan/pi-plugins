@@ -1,21 +1,25 @@
 # @nsyan/ssh 真机全量功能测试报告
 
 日期：2026-11-18
-被测代码：`packages/ssh`（工作区当前未提交改动，即 M1–M8 全量实现）
+被测代码：`packages/ssh`（M1–M8 全量实现 + P0/P1 修复）
 对照文档：`docs/superpowers/specs/2026-11-18-ssh-plugin-design.md`
 真机：`root@10.2.9.58`（Ubuntu 20.04，kernel 5.4，`/bin/sh` → dash，sshd 22，sudo 免密，9001 端口有 nginx）
 本地：macOS + Node 22.19，openssh 三件套齐全，`ftp-srv` 4.6.3 起本地 FTP
+
+> **2026-11-18 修复后复测：5 个 P0 + 13 个 P1 全部修复并真机验证通过（27/27），单测 113 → 128。**
+> 修复明细与复测结果见文末 §8。
 
 ## 0. 测试方式
 
 | 层 | 内容 | 结果 |
 |---|---|---|
-| 单元测试 | `npx tsx --test "test/**/*.test.ts"` | **112 pass / 0 fail** |
+| 单元测试 | `npx tsx --test "test/**/*.test.ts"` | **128 pass / 0 fail** |
 | 类型检查 | `npx tsc -p tsconfig.typecheck.json` | **0 error** |
-| 真机 E2E | 直接驱动 `createRuntime()` / `Ssh2Pool` / `transports/*` / `core/*`，不打桩，连 10.2.9.58 实跑 | 见下 |
-| FTP 集成 | 本地 `ftp-srv` 起 21xx 端口，测登录/列表/上传/覆盖/下载/续传/能力降级 | 见下 |
+| 真机 E2E（首轮） | 直接驱动 `createRuntime()` / `Ssh2Pool` / `transports/*` / `core/*`，不打桩，连 10.2.9.58 实跑 | 发现 5 P0 + 13 P1 |
+| 真机 E2E（复测） | 同一批用例 + 逐条 P0/P1 回归 | **27/27 通过** |
+| FTP 集成 | 本地 `ftp-srv` 起 21xx 端口，测登录/列表/上传/覆盖/下载/续传/能力降级 | 通过 |
 
-E2E 脚本：`/tmp/pi-ssh-e2e/harness*.ts`、`v1..v26.ts`（可复跑）。
+E2E 脚本：`/tmp/pi-ssh-e2e/harness*.ts`、`v1..v26.ts`、`retest.ts`（可复跑）。
 远端工作区：`/tmp/pi-ssh-e2e`（测试后已清理）。
 
 ---
@@ -258,3 +262,60 @@ openssh 那台「部署成功」是假象：ProxyJump / agent / 证书主机根�
 - 「§8 清理旧版本用 `plan.releasesDir`」→ 属实；但 tar 分支本身跑不到清理（P0-1）
 - 「§6.3 生产主机的 destructive 改成动作之前写审计」→ 属实，但同时保留了动作后那条，变成两条（P1-10）
 - 「§8 步骤 5 健康检查改成远端循环」→ 属实；但 `ssh_rollback` 完全没接健康检查（P1-2）
+
+---
+
+## 8. 修复与复测（2026-11-18 第二轮）
+
+### 8.1 修复清单
+
+**P0**
+
+| # | 问题 | 修复 | 复测 |
+|---|---|---|---|
+| P0-1 | `tar -tzf` 末尾空行被当成越界成员，任何合法 tar 包都整包拒绝 | `rejectArchiveMembers` 先 `map(trim)` 再 `filter(v => v !== "")`，空行不参与判定；越界成员仍逐个点名 | ✅ 真 tar 包全流程部署成功，子目录文件解包完整，`.part` 清理干净 |
+| P0-2 | `ssh_put` 传目录 → `EISDIR` 逃成 unhandledRejection，进程崩溃 | `sha256File` 先 `stat().isDirectory()` 拒绝并提示「先打包」；同时把 `readableWebStream()` 换成 `createReadStream` 异步迭代，错误落回 await | ✅ 抛 `Error: ...是目录...先打成压缩包`，进程存活、后续调用正常 |
+| P0-3 | FTP 把 `file:...#name` 引用当密码发出去，生产路径必然 530 | `ftp.open()` 改用 `profile.auth.password`，只对裸串 `secretRef` 兼容；runtime 侧 4 处 `withPassword` 全部换成 `resolveProfile`（含 keychain） | ✅ 用真实 `file:` 引用登录成功，服务端收到明文 `p`；上传/列表/下载全通 |
+| P0-4 | openssh 复用 ControlMaster 后返回 143 + 空输出（4/5 概率） | `execOpenSsh`/`copyOpenSsh` 的 stdin 从 `ignore` 改为 `pipe` 且不 `end()`，watchdog 的 `exec 3<&0` 才拿得到长连接 | ✅ 连续 5 次全部正确输出；大输出（3000 行）完整 |
+| P0-5 | `deploy`/`rollback` 只走 ssh2，openssh 静默降级、FTP 报 `ECONNREFUSED` | 新增 `runnerFor(host)`：openssh → `opensshRunner` + `scpPutVerified`；ssh2 → `poolRunner` + `pool.put`；FTP → `UnsupportedError` | ✅ openssh 的 file/tar 两种剧本都成功；FTP 明确报「只能传文件，不能部署或回滚」 |
+
+**P1**
+
+| # | 修复 | 复测 |
+|---|---|---|
+| P1-1 | 回滚候选过滤 `.part`，显式传 `.part` 也拒绝 | ✅ 有 `.part` 残留时正确回到 `r1`；`to: "zzz.part"` 被拒 |
+| P1-2 | `ssh_rollback` 补健康检查，确认框写明；失败报错并保留 `current` | ✅ `healthCmd: "false"` 时抛「健康检查未通过」 |
+| P1-3 | 文件回滚同时找 `<path>.bak.*` 与 `<root>/.pi-ssh-backup/<rel>.*`，失败时列出找过的位置 | ✅ 两个位置都能恢复；无备份时报错含「找过」 |
+| P1-4 | 重启失败走与健康检查同一条 `fallback`；回退时的重启用 `tryRun`，不再掩盖「已回退」 | ✅ `restartCmd: "exit 7"` 时 `rolledBack: true`，`current` 回到 `good1` |
+| P1-5 | 池新增 `fingerprintOf()`，连接复用时从池里取回指纹 | ✅ 已连接后 `testHost` 指纹非空且与首次一致 |
+| P1-6 | 传输层预算改为「加上本块之后」判定；runtime 回填 `spillPath` | ✅ `seq 1 3000` 的 `spillPath` 存在且全文完整；传输层 2500 行也落盘 |
+| P1-7 | 新增 `getOpenSsh`：scp 后双端 sha256 比对 | ✅ 返回真实 bytes/sha256，与本地文件一致 |
+| P1-8 | `execOpenSsh` 支持 `onData` 并接到 runtime | ✅ 4 次 `onData` 分片到达 |
+| P1-9 | openssh 输出经 `tail()` 统一截断并落盘 | ✅ `seq 1 5000` 标记截断并给出可用路径 |
+| P1-10 | 生产主机 destructive 只在动作前写一条；动作后的那条跳过 | ✅ 一次动作一条审计 |
+| P1-11 | `put`/`get` 审计补 `bytes`/`sha256`/`backupPath` | ✅ 三个字段都有值，覆盖时 `backupPath` 存在 |
+| P1-12 | 看门狗改判 `$-` 而非 `set -m` 退出码；无 job control 时用 `setsid` 建独立进程组 | ✅ dash 远端 `sleep 301 & sleep 302` 超时后无残留；abort 同样 |
+| P1-13 | 既无 job control 也无 `setsid` 时写 stderr 警告并置 `PI_SSH_NO_GROUP`，watcher 跳过组杀 | ✅ 正常命令无噪音；降级分支可判定 |
+
+**额外修复（复测中发现）**
+
+- `wrapSudo` 的 heredoc 原先嵌在 `sh -c '...'` 引号内，`$PI_SSH_PW` 到不了内层 shell（未 export）。改为 heredoc 挂在最外层调用（子 shell 或 `setsid`）上，密码正确送达且不被二次展开。
+- openssh 传输对老服务器会打 4 行 post-quantum 警告到 stderr，混进结果让「退出码 0」看起来像失败。新增 `stripSshNoise` 过滤，真实 stderr 保留。
+
+### 8.2 复测结果
+
+```
+########## P0 回归 ##########        5/5  PASS
+########## P1 回归 ##########       15/15 PASS
+########## 原有功能未回归 ##########  3/3  PASS
+===== 复测汇总：27/27 通过 =====
+```
+
+单测：**128 pass / 0 fail**（原 113 + 新增 15）
+类型检查：**0 error**
+
+新增用例覆盖：`rejectArchiveMembers` 尾空行、`sha256File` 拒目录、看门狗 `$-` 分支与 setsid、sudo heredoc 位置、`stripSshNoise`、备份位置两套规则。
+
+### 8.3 仍存在的偏差（P2，未修）
+
+首轮报告 §4 的 P2 系列（`/ssh scan` 与 `/ssh config` 子命令缺失、`ssh_host_save` 无 transport 参数、`capabilities`/`verified` 字段未实现、`waitFor` 无本地回退、`ftp-srv` 未进 devDependencies 等）本轮未动，属功能补全而非缺陷，建议后续单独排期。

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,5 +69,23 @@ describe("secrets", () => {
     const file = join(dir(), "broken.json");
     writeFileSync(file, "{");
     assert.throws(() => putSecret(file, "web", "next"), /凭据文件损坏/);
+  });
+});
+
+describe("sha256File 拒绝目录", () => {
+  it("传目录抛可读错误，不是 EISDIR 逃逸成 unhandledRejection", async () => {
+    const { sha256File } = await import("../src/core/hash.js");
+    const dir = mkdtempSync(join(tmpdir(), "pi-ssh-dir-"));
+    await assert.rejects(() => sha256File(dir), /是目录/);
+  });
+
+  it("普通文件照旧算出 sha256 与字节数", async () => {
+    const { sha256File } = await import("../src/core/hash.js");
+    const dir = mkdtempSync(join(tmpdir(), "pi-ssh-file-"));
+    const file = join(dir, "a.txt");
+    writeFileSync(file, "hello");
+    const result = await sha256File(file);
+    assert.equal(result.bytes, 5);
+    assert.equal(result.hash, createHash("sha256").update("hello").digest("hex"));
   });
 });
