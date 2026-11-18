@@ -2,6 +2,33 @@
 
 本仓库遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [ssh 0.1.0] - 2026-11-18
+
+### Added（packages/ssh）
+
+- **新包 `@nsyan/ssh`**：pi 的远程运维扩展，SSH/SFTP/FTP 一套工具覆盖「连、看、改、传、部署、回滚、转发」。设计见 `docs/superpowers/specs/2026-11-18-ssh-plugin-design.md`
+  - **13 个工具**：`ssh_hosts`（主机清单）/`ssh_exec`/`ssh_sudo`/`ssh_ls`/`ssh_read`/`ssh_put`/`ssh_get`/`ssh_deploy`/`ssh_rollback`/`ssh_tunnel`/`ssh_doctor`/`ssh_scan_sources`/`ssh_host_save`，管理命令 `/ssh`
+  - **危险命令分级确认**：policy 按 §6.1 全表分类，危险动作走确认弹窗（用户拒绝后不重试）
+  - **审计**：远端动作追加 JSONL（`~/.pi/agent/ssh-audit.jsonl`），单文件超 1MB 滚动、保留最近 7 份，stdin 永不落明文
+  - **凭据不入模型上下文**：工具 schema 无 password 字段；密码只经掩码弹窗进 0600 文件或钥匙串（钥匙串只读，macOS 不用 `security -w` 传新密码）
+  - **部署一等公民**：只认主机配置里的 `deploy` 布局，重启命令与健康检查不可调用时临时传入；tar/目录上传到 `releases/<ts>/` 后切软链，健康检查失败自动切回上一版，`ssh_rollback` 手动回退
+  - **known_hosts 校验 + `ssh_doctor` 体检**：Node 版本、ssh2、本机 ssh、known_hosts 可写、钥匙串可用性、审计可写
+  - **自动建连**：`ssh_scan_sources` 扫 `~/.ssh/config` 与项目部署文件出候选，`ssh_host_save` 逐个确认后写盘
+  - **双传输**：ssh2（纯 JS 跨平台，含 SFTP）与 openssh（继承 ProxyJump/agent/MFA）；FTP/FTPS 走同一传输抽象
+  - **零 pi 运行时依赖的 core 层**：`src/core` 与 `src/transports` 不 import 任何 pi 模块，为将来输出 MCP server 铺路
+  - **发布配置**：`files` 白名单含 `index.ts`/`src/`/`skills/`/`README.md`/`LICENSE`，附 LICENSE 与 `engines.node >= 18`，keywords 补 `scp`/`remote`/`devops`/`rollback`
+  - 测试 100 项全绿，`tsc` 类型检查零错误
+- 版本号 0.1.0（首个公开版，API 未冻结）
+
+## [1.3.5] - 2026-10-21
+
+### Fixed（packages/db）
+
+- **修复 hive/spark 依赖链缺 `ws` 导致整个扩展加载失败**：依赖链 `hive-driver → thrift → isomorphic-ws`，其中 isomorphic-ws 把 `ws` 声明为 **peerDependencies**（自身无实体依赖）。npm 扁平安装时 thrift 自带的 `ws@5` 可能只嵌套在 `thrift/node_modules` 而未提升到安装根，此时被提升到根的 isomorphic-ws `require('ws')` 直接 `Cannot find module 'ws'`——而 `index.ts` 顶层静态 import 全部方言（含 Hive/Spark），一条链炸掉整个扩展（6 工具 + `/db` 全部注册不上，且 pi 静默记 "Failed to load extension"、插件页仍显示"已加载"，极具迷惑性）。本地 pnpm 因严格布局 + auto-install-peers 把 peer 自动补齐，开发期完全无感。修复：
+  - `package.json` dependencies **显式声明 `ws@^8.22.0`**（npm 对顶层包的直接依赖保证提升到安装根；isomorphic-ws 的 peer 规范为 `*`，可解析任意版本）
+  - 新增 `test/hive-driver-load.test.ts` 回归：在任一包管理器下 `import("ws")` 与 `import("hive-driver")` 必须可解析，移除 ws 依赖时测试先红；测试 187 → 189
+- 版本号 1.3.5
+
 ## [1.3.4] - 2026-09-23
 
 ### Added（packages/db）

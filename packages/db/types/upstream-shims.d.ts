@@ -22,3 +22,7 @@ declare module "oracledb" {
   }
   export = oracledb;
 }
+
+// ws：包本体不带类型（@types/ws 未引入），无 body 声明即可满足动态 import 的类型解析
+// （仅 test/hive-driver-load.test.ts 回归用；不可对其成员做类型访问，见上方踩坑记录 2）。
+declare module "ws";

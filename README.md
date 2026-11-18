@@ -13,6 +13,7 @@
 | 包 | 描述 |
 |------|------|
 | [db](./packages/db) | AI 接入数据库 —— 方言化架构，支持 PostgreSQL/MySQL/Oracle/达梦/Redis/Elasticsearch/MongoDB/Neo4j/Hive/Spark 十种数据库，提供查询/表结构/扫描建连工具 |
+| [ssh](./packages/ssh) | AI 远程运维 —— SSH/SFTP/FTP：13 个 ssh_* 工具 + `/ssh` 管理面板，危险命令分级确认、JSONL 审计、known_hosts 校验、release+软链部署与自动回滚 |
 
 ## 🚀 安装
 
@@ -20,12 +21,14 @@
 
 ```bash
 pi install npm:@nsyan/db     # db —— AI 数据库接入
+pi install npm:@nsyan/ssh    # ssh —— AI 远程运维（SSH/SFTP/FTP）
 ```
 
 仓库开发者走本地路径：
 
 ```bash
 pi install ./packages/db
+pi install ./packages/ssh
 ```
 
 ## 📁 目录结构
@@ -33,7 +36,8 @@ pi install ./packages/db
 ```
 pi-plugins/
 ├── packages/
-│   └── db/        # 数据库接入插件
+│   ├── db/        # 数据库接入插件
+│   └── ssh/       # 远程运维插件
 ├── pnpm-workspace.yaml
 ├── package.json
 ├── .gitignore
@@ -55,7 +59,7 @@ pnpm test             # 运行全部包的测试
 
 ## 📜 更新记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **1.3.3**（2026-09-14）：发布元数据优化——description 压入 npm 255 字符上限、补全检索关键词、发布包附 LICENSE 与 engines 声明。
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.5**（2026-10-21，修复 hive/spark 依赖链缺 `ws` 致扩展整体加载失败）、ssh **0.1.0**（首个公开版）。
 
 ## 📄 许可
 
