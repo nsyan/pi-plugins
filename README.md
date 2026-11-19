@@ -46,7 +46,7 @@ pi-plugins/
 │   │   └── test/
 │   └── ssh/           # 远程运维插件
 │       ├── src/{core,transports,ui,scan}/
-│       ├── skills/{remote-ops,deploy}/
+│       ├── skills/deploy/
 │       └── test/
 ├── docs/superpowers/  # 设计文档 / 测试报告 / 回归手册
 ├── pnpm-workspace.yaml
@@ -77,7 +77,7 @@ pnpm --filter @nsyan/ssh typecheck
 
 ## 📜 更新记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.8**（2026-11-19，读写判定改为白名单，只读模式真正拦住 `COPY`/`GRANT`/`SET`/`VACUUM`/`DO`/`EXPLAIN ANALYZE` 等此前漏判的写语句；生产连接写审计改为先落盘再执行；配置改原子写且损坏不再静默当成空列表）、ssh **0.1.5**（2026-11-18，修复部署失败后残留半成品 release 目录——此前越界包被拒或解包失败会在远端留下空 `releases/<ts>`，会被回滚当成有效候选）。
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本：db **1.3.8**（2026-11-19，读写判定改为白名单，只读模式真正拦住 `COPY`/`GRANT`/`SET`/`VACUUM`/`DO`/`EXPLAIN ANALYZE` 等此前漏判的写语句；生产连接写审计改为先落盘再执行；配置改原子写且损坏不再静默当成空列表）、ssh **0.1.6**（2026-11-19，修复随包的两个 skill 自 0.1.0 起就没被加载——缺 frontmatter 中的 description 被 pi 的 loader 静默丢弃；remote-ops 并入常驻提示后删除，deploy 瘦身为 5 条并补上真实 loader 的回归测试）。
 
 ## 📄 许可
 

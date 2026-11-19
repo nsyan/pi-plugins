@@ -174,6 +174,7 @@ export default function sshExtension(pi: ExtensionAPI) {
       "用 ssh_exec 跑远端命令，不要用本机 bash 里的 ssh。",
       "已配置多台主机时，ssh_exec 必须传 host。",
       "用户拒绝后不要改写命令再试。",
+      "FTP/FTPS 主机只能传文件，ssh_exec 与 ssh_read 会明确拒绝。",
     ],
     parameters: Type.Object({
       command: Type.String({ description: "远端命令" }),
@@ -423,6 +424,9 @@ export default function sshExtension(pi: ExtensionAPI) {
     label: "保存 SSH 主机",
     description: "先实测连接，再把主机写入配置。没有私钥时密码进 0600 文件，不进参数。同名时覆盖、改名或跳过。",
     promptSnippet: "实测通过后再保存一台 SSH 主机。",
+    promptGuidelines: [
+      "首次连接遇到未知主机密钥会失败并给出 SHA256 指纹，让用户用 ssh-keygen -lf 核对后再确认，不要用 acceptNewHostKey 跳过核对。",
+    ],
     parameters: Type.Object({
       name: Type.String(),
       host: Type.String(),

@@ -35,6 +35,16 @@
 - **测试**：新增 `sql-write-detection.test.ts`（白名单姿态 / 高风险标记 / dollar-quoted 块 / 四家族只读拦截，20 例）、`policy-hardening.test.ts`（highRisk 通道 / auditRequired / 审计 fail-closed，12 例）、`config-atomic.test.ts`（原子写 / 损坏检测 / 导出权限，5 例），测试 189 → 226
 - **e2e 脚本**：新增 `scripts/e2e-live.mts`（用本机真实连接跑测试连接/列表/结构/查询/只读拦截）、`scripts/e2e-tools.mts`（mock 宿主装载扩展，验证工具层拦截、理由校验、审计顺序）、`scripts/e2e-write.mts`（临时 schema 内跑完整 DDL+DML 并清理，确认收紧后合法写仍能执行）
 
+## [ssh 0.1.6] - 2026-11-19
+
+### Fixed（packages/ssh）—— 随包的两个 skill 从未生效
+
+- **两个 skill 都缺 frontmatter，被 pi 的 loader 静默丢弃**：`skills/deploy/SKILL.md` 与 `skills/remote-ops/SKILL.md` 自 0.1.0 起就没有 YAML frontmatter，而 loader 对没有 `description` 的 skill 只产出一条 `description is required` 诊断后丢弃（**不抛错**）——启动时那两行 warning 就是它们，部署与远端操作纪律从未进过模型上下文。现已补齐 `name` + 写明「何时使用」的 `description`
+- **删除 `remote-ops` skill**：8 条内容里 4 条与工具常驻提示逐字重复（`ssh_exec`/`ssh_put`/`ssh_sudo` 的 `promptGuidelines`），2 条是运行时自己会说的话（`core/guard.ts` 的「没有 job control 也没有 setsid」警告、`transports/ssh2.ts` 的 50KB/2000 行截断），边际价值接近零。其独有的两条规则改为常驻提示：`ssh_host_save` 补「未知主机密钥先核对 SHA256，别用 `acceptNewHostKey` 跳过」，`ssh_exec` 补「FTP/FTPS 主机只能传文件」
+- **`deploy` skill 瘦身为 5 条**：只留真正独有且会造成事故的纪律（不要用 `ssh_exec` 拼 `rm` 冒充部署、先 `dryRun` 看剧本、布局只从主机配置读且改布局用 `/ssh edit`、自动回退后不要盲重试同一个包、`release`/`file` 两种回滚与 FTP 无部署能力），去掉 `60s`、`50KB/2000 行`、`.pi-ssh-backup` 这类会随代码漂移的写死常量；其中旧文案里 `.pi-ssh-backup` 的查找顺序本就是反的（`runtime.ts` 实为先同目录 `.bak.*` 再 `.pi-ssh-backup/`）
+- **测试**：新增 `test/skills.test.ts`，用 pi 自己的 `loadSkillsFromDir`（真实 loader，不是手写 YAML 校验）断言只加载到 `deploy`、`diagnostics` 为空，并校验 `description` 写明何时使用——「缺 description 被静默丢弃」从此有回归拦截，测试 212 → 214
+- **文档**：根 `README.md` 目录树 `skills/{remote-ops,deploy}/` 同步为 `skills/deploy/`
+
 ## [ssh 0.1.5] - 2026-11-18
 
 ### Fixed（packages/ssh）
